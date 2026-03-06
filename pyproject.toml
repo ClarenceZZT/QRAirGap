@@ -1,0 +1,12 @@
+[project]
+name = "qrairgap"
+version = "0.1.0"
+description = "QR code based air-gap data transfer system"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyzbar>=0.1.9",
+    "opencv-python-headless>=4.8",
+    "mss>=9.0",
+    "Pillow>=10.0",
+]
