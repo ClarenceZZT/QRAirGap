@@ -43,8 +43,14 @@ from pyzbar.pyzbar import decode as _pyzbar_decode_raw, ZBarSymbol
 
 from protocol import decode_chunk, is_end_signal
 
-_cv2_qr_detector = cv2.QRCodeDetector()
+_thread_local = threading.local()
 _receiver_verbose = False
+
+
+def _get_cv2_qr_detector():
+    if not hasattr(_thread_local, 'detector'):
+        _thread_local.detector = cv2.QRCodeDetector()
+    return _thread_local.detector
 
 
 def _log_v(msg):
@@ -241,16 +247,24 @@ class RegionSelector(object):
         self.root.destroy()
 
 
+_decode_stats = {"total": 0, "fast_ok": 0}
+
+
 def try_decode_qr(frame_bgr):
-    """Try pyzbar + cv2 QRCodeDetector with multiple preprocessing strategies."""
+    """Try pyzbar + cv2 QRCodeDetector with multiple preprocessing strategies.
+    Skips expensive upscale strategy when fast strategies have high success rate."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    _decode_stats["total"] += 1
 
     results = pyzbar_decode(gray)
     if results:
+        _decode_stats["fast_ok"] += 1
         return results[0].data.decode("utf-8", errors="replace")
 
-    text, _, _ = _cv2_qr_detector.detectAndDecode(gray)
+    text, _, _ = _get_cv2_qr_detector().detectAndDecode(gray)
     if text:
+        _decode_stats["fast_ok"] += 1
         return text
 
     thresh = cv2.adaptiveThreshold(
@@ -258,18 +272,24 @@ def try_decode_qr(frame_bgr):
     )
     results = pyzbar_decode(thresh)
     if results:
+        _decode_stats["fast_ok"] += 1
         return results[0].data.decode("utf-8", errors="replace")
 
-    text, _, _ = _cv2_qr_detector.detectAndDecode(thresh)
+    text, _, _ = _get_cv2_qr_detector().detectAndDecode(thresh)
     if text:
+        _decode_stats["fast_ok"] += 1
         return text
+
+    stats = _decode_stats
+    if stats["total"] > 30 and stats["fast_ok"] / stats["total"] > 0.9:
+        return None
 
     h, w = gray.shape
     upscaled = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
     results = pyzbar_decode(upscaled)
     if results:
         return results[0].data.decode("utf-8", errors="replace")
-    text, _, _ = _cv2_qr_detector.detectAndDecode(upscaled)
+    text, _, _ = _get_cv2_qr_detector().detectAndDecode(upscaled)
     if text:
         return text
 
@@ -332,45 +352,143 @@ def _check_key_pressed():
     return None
 
 
-def _send_keystroke_async(key, delay=1.5):
+_ACTIVATE_SENDER_SCRIPT = '''
+tell application "System Events"
+    repeat with p in (every process whose background only is false)
+        try
+            repeat with w in every window of p
+                if name of w contains "QR Air Gap" then
+                    set frontmost of p to true
+                    return "ok"
+                end if
+            end repeat
+        end try
+    end repeat
+    return "not found"
+end tell
+'''
+
+
+def _activate_sender_window():
+    """Bring the sender's Tk window to the front before sending keystrokes."""
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', _ACTIVATE_SENDER_SCRIPT],
+            timeout=5, capture_output=True,
+        )
+        status = result.stdout.decode().strip()
+        if status == "not found":
+            print("[auto] Warning: 'QR Air Gap' window not found, sending to frontmost")
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _send_keystroke_async(key, delay=0.5):
     """Simulate a keystroke in a background thread (non-blocking)."""
     def _do():
         time.sleep(delay)
         try:
+            _activate_sender_window()
+            time.sleep(0.2)
             subprocess.run(
                 ['osascript', '-e',
                  'tell application "System Events" to keystroke "{}"'.format(key)],
                 timeout=5, capture_output=True,
             )
-            print("[auto] Sent '{}' keystroke to frontmost window".format(key))
+            print("[auto] Sent '{}' keystroke".format(key))
         except Exception as e:
             print("[auto] Failed to send keystroke: {}".format(e))
     threading.Thread(target=_do, daemon=True).start()
 
 
-def _send_missing_frames_async(missing_indices, delay=1.0):
-    """Send missing frame indices to sender via keyboard: m<csv repeated>\r"""
+_sending_missing = False
+
+
+def _encode_ranges(indices):
+    """Encode sorted indices as compact ranges: [1,2,3,5,6,8] -> '1-3,5-6,8'"""
+    if not indices:
+        return ""
+    s = sorted(indices)
+    ranges = []
+    start = end = s[0]
+    for i in s[1:]:
+        if i == end + 1:
+            end = i
+        else:
+            ranges.append("{}-{}".format(start, end) if start != end else str(start))
+            start = end = i
+    ranges.append("{}-{}".format(start, end) if start != end else str(start))
+    return ",".join(ranges)
+
+
+def _send_missing_frames_async(missing_indices, delay=0.3, max_csv_len=200):
+    """Send missing frame indices to sender via keystroke with range encoding.
+
+    If the range-encoded CSV exceeds max_csv_len, it is split into multiple
+    batches sent sequentially. The sender accumulates frames from each batch.
+    """
+    global _sending_missing
+    if _sending_missing:
+        return
+    _sending_missing = True
+
     def _do():
-        time.sleep(delay)
-        csv_part = ",".join(str(i) for i in sorted(missing_indices))
-        payload = "m{csv},{csv}\r".format(csv=csv_part)
+        global _sending_missing
         try:
-            subprocess.run(
-                ['osascript', '-e',
-                 'tell application "System Events" to keystroke "{}"'.format(payload)],
-                timeout=10, capture_output=True,
-            )
-            print("[auto] Sent missing frames signal: {} frames {}".format(
-                len(missing_indices), sorted(missing_indices)))
+            time.sleep(delay)
+            range_csv = _encode_ranges(missing_indices)
+
+            if len(range_csv) <= max_csv_len:
+                batches = [range_csv]
+            else:
+                parts = range_csv.split(',')
+                batches = []
+                cur = []
+                cur_len = 0
+                for part in parts:
+                    added = len(part) + (1 if cur else 0)
+                    if cur_len + added > max_csv_len and cur:
+                        batches.append(",".join(cur))
+                        cur = [part]
+                        cur_len = len(part)
+                    else:
+                        cur.append(part)
+                        cur_len += added
+                if cur:
+                    batches.append(",".join(cur))
+
+            _activate_sender_window()
+            time.sleep(0.3)
+            for i, batch_csv in enumerate(batches):
+                prefix = "m" if i == 0 else "a"
+                payload = "{p}{r},{r}.".format(p=prefix, r=batch_csv)
+                subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to keystroke "{}"'.format(payload)],
+                    timeout=10, capture_output=True,
+                )
+                if len(batches) > 1:
+                    print("[auto] Batch {}/{}: {} chars".format(
+                        i + 1, len(batches), len(payload)))
+                if i < len(batches) - 1:
+                    time.sleep(0.5)
+            print("[auto] Sent missing frames: {} frames ({} batch{}, {} total chars)".format(
+                len(missing_indices), len(batches),
+                "es" if len(batches) > 1 else "",
+                sum(len("m{r},{r}.".format(r=b)) for b in batches)))
         except Exception as e:
             print("[auto] Failed to send missing frames: {}".format(e))
+        finally:
+            _sending_missing = False
     threading.Thread(target=_do, daemon=True).start()
 
 
 def _safe_filename(filename):
     """Strip path traversal components to keep files inside outdir."""
     parts = filename.replace("\\", "/").split("/")
-    safe = [p for p in parts if p and p != ".."]
+    safe = [p for p in parts if p and p not in ("..", ".")]
     return os.path.join(*safe) if safe else None
 
 
@@ -384,12 +502,13 @@ def _save_file(received, total, filename, outdir):
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
     missing = set(range(total)) - set(received.keys())
-    output_data = b""
+    parts = []
     for i in range(total):
         if i in received:
-            output_data += received[i]
+            parts.append(received[i])
         else:
-            output_data += b"[MISSING CHUNK %d]" % i
+            parts.append(b"[MISSING CHUNK %d]" % i)
+    output_data = b"".join(parts)
 
     with open(outpath, "wb") as f:
         f.write(output_data)
@@ -416,7 +535,7 @@ def _capture_thread(region, frame_queue, stop_event, interval, debug):
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             frame_count += 1
 
-            if frame_count == 1 or (debug and frame_count <= 20):
+            if debug and frame_count <= 20:
                 path = "debug_frames/frame_{:04d}.png".format(frame_count)
                 cv2.imwrite(path, frame_bgr)
 
@@ -493,7 +612,8 @@ def main():
     ))
 
     os.makedirs(args.outdir, exist_ok=True)
-    os.makedirs("debug_frames", exist_ok=True)
+    if args.debug:
+        os.makedirs("debug_frames", exist_ok=True)
 
     interval = 1.0 / args.fps
     frame_queue = queue.Queue(maxsize=8)
@@ -528,8 +648,7 @@ def main():
     decode_fail_count = 0
     end_received = False
     completed_sids = set()
-    missing_signal_sent = False
-    new_since_signal = 0
+    last_decoded_idx = -1
 
     old_settings = termios.tcgetattr(sys.stdin)
     try:
@@ -588,9 +707,8 @@ def main():
                     session_id = sid
                     total = chunk_info["total"]
                     current_filename = fname
-                    missing_signal_sent = False
-                    new_since_signal = 0
-                    sys.stdout.write("\r" + " " * 80 + "\r")
+                    last_decoded_idx = -1
+                    sys.stdout.write("\r\033[2K")
                     print("Session detected: {}  File: {}  Chunks: {}".format(
                         sid, fname or "(unnamed)", total
                     ))
@@ -602,9 +720,8 @@ def main():
                     current_filename = fname
                     warned = False
                     decode_fail_count = 0
-                    missing_signal_sent = False
-                    new_since_signal = 0
-                    sys.stdout.write("\r" + " " * 80 + "\r")
+                    last_decoded_idx = -1
+                    sys.stdout.write("\r\033[2K")
                     print("\nNew session detected: {}  File: {}  Chunks: {}".format(
                         sid, fname or "(unnamed)", total
                     ))
@@ -614,20 +731,22 @@ def main():
                     received[idx] = chunk_info["data"]
                     last_new_time = time.time()
                     warned = False
-                    new_since_signal += 1
                     if total is not None:
                         print_progress(session_id, len(received), total, args.fps, current_filename)
 
-                if not is_new and total is not None and len(received) < total:
-                    can_send = not missing_signal_sent or new_since_signal > 0
-                    if can_send:
+                same_as_last = (idx == last_decoded_idx)
+                last_decoded_idx = idx
+
+                if not is_new and not same_as_last and total is not None and len(received) < total:
+                    if not _sending_missing:
                         missing = sorted(set(range(total)) - set(received.keys()))
                         if missing:
-                            print("\n[resend] Duplicate frame {} detected, missing {} frames {}".format(
-                                idx, len(missing), missing))
+                            missing_show = missing[:20]
+                            suffix = " ..." if len(missing) > 20 else ""
+                            print("\n[resend] Duplicate frame {} detected, missing {} frames [{}{}]".format(
+                                idx, len(missing),
+                                ", ".join(str(x) for x in missing_show), suffix))
                             _send_missing_frames_async(missing)
-                            missing_signal_sent = True
-                            new_since_signal = 0
 
                 if total is not None and len(received) >= total:
                     _save_file(received, total, current_filename, args.outdir)
@@ -640,8 +759,7 @@ def main():
                     current_filename = ""
                     warned = False
                     decode_fail_count = 0
-                    missing_signal_sent = False
-                    new_since_signal = 0
+                    last_decoded_idx = -1
 
                     if args.auto_next:
                         print("Auto-sending 'n' to switch to next file...")
@@ -661,7 +779,6 @@ def main():
                         args.timeout, missing_str
                     ))
                     warned = True
-                    last_new_time = time.time()
 
             time.sleep(0.02)
 

@@ -15,8 +15,12 @@ import time as _time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-_vendor_zip = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qrcode_vendor.zip')
-if os.path.isfile(_vendor_zip):
+_here = os.path.dirname(os.path.abspath(__file__))
+_vendor_dir = os.path.join(_here, 'qrcode_vendor')
+_vendor_zip = os.path.join(_here, 'qrcode_vendor.zip')
+if os.path.isdir(_vendor_dir):
+    sys.path.insert(0, _vendor_dir)
+elif os.path.isfile(_vendor_zip):
     sys.path.insert(0, _vendor_zip)
 
 import tkinter as tk
@@ -27,6 +31,7 @@ from qrcode.constants import ERROR_CORRECT_L
 from protocol import generate_session_id, chunk_data, encode_chunk, encode_end_signal
 
 _verbose = False
+_stop_event = threading.Event()
 
 
 def _log(msg):
@@ -50,6 +55,8 @@ def _determine_qr_version(payloads):
 
 def _generate_single_qr(args_tuple):
     payload, version, box_size, border, idx = args_tuple
+    if _stop_event.is_set():
+        return idx, None
     qr = qrcode.QRCode(
         version=version,
         error_correction=ERROR_CORRECT_L,
@@ -58,11 +65,13 @@ def _generate_single_qr(args_tuple):
     )
     qr.add_data(payload)
     qr.make(fit=True)
-    return idx, qr.make_image(fill_color="black", back_color="white").get_image()
+    img = qr.make_image(fill_color="black", back_color="white").get_image()
+    _time.sleep(0.1)
+    return idx, img
 
 
 def _generate_qr_images_into(images, payloads, version, box_size, border,
-                              start=0, end=None):
+                              start=0, end=None, on_progress=None):
     """Generate QR images into an existing list. Thread-safe for non-overlapping ranges."""
     if end is None:
         end = len(payloads)
@@ -70,23 +79,32 @@ def _generate_qr_images_into(images, payloads, version, box_size, border,
     workers = min(n, 4)
     t0 = _time.time()
     done = [0]
+
+    def _tick(idx, img):
+        images[idx] = img
+        done[0] += 1
+        if _verbose:
+            _print_qr_progress(done[0], n, t0)
+        if on_progress:
+            on_progress(done[0], n)
+
     if workers <= 1:
         for i in range(start, end):
-            _, img = _generate_single_qr((payloads[i], version, box_size, border, i))
-            images[i] = img
-            done[0] += 1
-            if _verbose:
-                _print_qr_progress(done[0], n, t0)
+            result_idx, result_img = _generate_single_qr((payloads[i], version, box_size, border, i))
+            _tick(result_idx, result_img)
     else:
         tasks = [(payloads[i], version, box_size, border, i) for i in range(start, end)]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_generate_single_qr, t) for t in tasks]
-            for future in as_completed(futures):
-                idx, img = future.result()
-                images[idx] = img
-                done[0] += 1
-                if _verbose:
-                    _print_qr_progress(done[0], n, t0)
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = [pool.submit(_generate_single_qr, t) for t in tasks]
+        for future in as_completed(futures):
+            if _stop_event.is_set():
+                break
+            idx, img = future.result()
+            if img is not None:
+                _tick(idx, img)
+        for f in futures:
+            f.cancel()
+        pool.shutdown(wait=False)
     if _verbose:
         sys.stdout.write("\n")
     elapsed = _time.time() - t0
@@ -115,7 +133,7 @@ def _print_qr_progress(done, total, t0):
     content = "  [qr] [{}] {}/{} ({}%) {:.1f}s {}".format(
         bar, done, total, pct, elapsed, eta_s)
     with _progress_lock:
-        sys.stdout.write("\r" + content.ljust(tw - 1))
+        sys.stdout.write("\r" + content[:tw - 1].ljust(tw - 1))
         sys.stdout.flush()
 
 
@@ -130,6 +148,8 @@ def prepare_file_meta(filepath, chunk_size, box_size, base_dir=None):
         filename = os.path.basename(filepath)
     sid = generate_session_id()
     chunks = chunk_data(data, chunk_size)
+    if not chunks:
+        chunks = [b""]
     total = len(chunks)
     _log("[prepare] {} -> sid={}, {} bytes, {} chunks (chunk_size={})".format(
         filename, sid, len(data), total, chunk_size))
@@ -235,6 +255,7 @@ class SenderApp(object):
         self._missing_pos = 0
         self._input_mode = False
         self._input_buffer = ""
+        self._input_timeout_id = None
 
         self._prepare_current()
         self._start_countdown()
@@ -257,43 +278,66 @@ class SenderApp(object):
     def _prepare_current(self):
         if self.file_index not in self.file_cache:
             path = self.file_paths[self.file_index]
+            fi = self.file_index
             _log("[app] Encoding file {}/{}: {}".format(
-                self.file_index + 1, len(self.file_paths), path))
-            try:
-                self.root.config(cursor="wait")
-            except tk.TclError:
-                pass
-            self.root.update()
-            meta = prepare_file_meta(path, self.chunk_size, self.box_size, self.base_dir)
-            _, first_img = _generate_single_qr((
-                meta["payloads"][0], meta["version"],
-                self.box_size, 6, 0))
-            meta["pil_images"][0] = first_img
-            with self._preload_lock:
-                self.file_cache[self.file_index] = meta
-            try:
-                self.root.config(cursor="")
-            except tk.TclError:
-                pass
-            if meta["total"] > 1:
-                _log("[app] First frame ready, generating rest in background...")
-                fi = self.file_index
-                def _fill_rest():
+                fi + 1, len(self.file_paths), path))
+            self.file_var.set("File {}/{}: {} (loading...)".format(
+                fi + 1, len(self.file_paths), os.path.basename(path)))
+
+            def _bg_prepare():
+                meta = prepare_file_meta(path, self.chunk_size, self.box_size, self.base_dir)
+                _, first_img = _generate_single_qr((
+                    meta["payloads"][0], meta["version"],
+                    self.box_size, 6, 0))
+                meta["pil_images"][0] = first_img
+                with self._preload_lock:
+                    self.file_cache[fi] = meta
+                total_frames = meta["total"]
+                self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                if total_frames > 1:
+                    _log("[app] First frame ready, generating rest in background...")
+                    def _on_progress(batch_done, batch_total):
+                        overall = batch_done + 1
+                        if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
+                            self.root.after(0, lambda d=overall: self._update_gen_progress(fi, d, total_frames))
                     _generate_qr_images_into(
                         meta["pil_images"], meta["payloads"],
                         meta["version"], self.box_size, 6,
-                        start=1)
-                    _log("[app] File {} all {} frames ready".format(fi + 1, meta["total"]))
-                threading.Thread(target=_fill_rest, daemon=True).start()
+                        start=1, on_progress=_on_progress)
+                    _log("[app] File {} all {} frames ready".format(fi + 1, total_frames))
+                self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                self.root.after(0, self._preload_next)
+
+            threading.Thread(target=_bg_prepare, daemon=True).start()
         else:
             _log("[app] File {}/{} already cached".format(
                 self.file_index + 1, len(self.file_paths)))
-        info = self._current_info()
+            info = self._current_info()
+            self.file_var.set("File {}/{}: {} ({} B, {} chunks)".format(
+                self.file_index + 1, len(self.file_paths),
+                info["filename"], info["size"], info["total"],
+            ))
+            self._preload_next()
+
+    def _on_file_ready(self, fi, meta):
+        if fi != self.file_index:
+            return
         self.file_var.set("File {}/{}: {} ({} B, {} chunks)".format(
-            self.file_index + 1, len(self.file_paths),
-            info["filename"], info["size"], info["total"],
+            fi + 1, len(self.file_paths),
+            meta["filename"], meta["size"], meta["total"],
         ))
-        self._preload_next()
+
+    def _update_gen_progress(self, fi, done, total):
+        if fi != self.file_index:
+            return
+        info = self.file_cache.get(fi)
+        if info is None:
+            return
+        pct = done * 100 // total
+        self.file_var.set("File {}/{}: {} ({} B) — QR {}% ({}/{})".format(
+            fi + 1, len(self.file_paths),
+            info["filename"], info["size"], pct, done, total,
+        ))
 
     def _preload_next(self):
         if self._preload_thread is not None and self._preload_thread.is_alive():
@@ -351,31 +395,43 @@ class SenderApp(object):
             self._after_id = self.root.after(self.interval, self._show_frame)
             return
 
+        if self.file_index not in self.file_cache:
+            self.status_var.set("Loading file...")
+            self._after_id = self.root.after(100, self._show_frame)
+            return
+
         info = self._current_info()
 
         if self._missing_frames is not None:
             frame_idx = self._missing_frames[self._missing_pos]
+        else:
+            frame_idx = self.current_chunk
+
+        tk_img = self._get_tk_image(frame_idx)
+        if tk_img is None:
+            ready = sum(1 for img in info["pil_images"] if img is not None)
+            pct = ready * 100 // info["total"]
+            self.status_var.set("Generating QR {}%  ({}/{})".format(pct, ready, info["total"]))
+            self._after_id = self.root.after(50, self._show_frame)
+            return
+
+        if self._missing_frames is not None:
             self._missing_pos = (self._missing_pos + 1) % len(self._missing_frames)
             label = "RESEND {}/{} (frame {})".format(
                 self._missing_pos or len(self._missing_frames),
                 len(self._missing_frames), frame_idx + 1,
             )
         else:
-            frame_idx = self.current_chunk
             self.current_chunk = (self.current_chunk + 1) % info["total"]
             label = "chunk {}/{}".format(frame_idx + 1, info["total"])
 
-        tk_img = self._get_tk_image(frame_idx)
-        if tk_img is None:
-            self.status_var.set("Generating frame {}...".format(frame_idx + 1))
-            self._after_id = self.root.after(50, self._show_frame)
-            return
-
-        if self.img_on_canvas is not None:
-            self.canvas.delete(self.img_on_canvas)
         cx = self.canvas.winfo_width() // 2
         cy = self.canvas.winfo_height() // 2
-        self.img_on_canvas = self.canvas.create_image(cx, cy, image=tk_img)
+        if self.img_on_canvas is not None:
+            self.canvas.itemconfig(self.img_on_canvas, image=tk_img)
+            self.canvas.coords(self.img_on_canvas, cx, cy)
+        else:
+            self.img_on_canvas = self.canvas.create_image(cx, cy, image=tk_img)
 
         self.status_var.set("[{}]  {}   {:.1f} fps".format(
             info["sid"], label, self.fps
@@ -392,6 +448,9 @@ class SenderApp(object):
         self._missing_pos = 0
         self._input_mode = False
         self._input_buffer = ""
+        if self._input_timeout_id is not None:
+            self.root.after_cancel(self._input_timeout_id)
+            self._input_timeout_id = None
         if self.img_on_canvas is not None:
             self.canvas.delete(self.img_on_canvas)
             self.img_on_canvas = None
@@ -400,6 +459,8 @@ class SenderApp(object):
         self._start_countdown()
 
     def _next_file(self, event=None):
+        if self._input_mode:
+            return
         if self.file_index + 1 < len(self.file_paths):
             self.file_index += 1
             self._switch_file()
@@ -407,6 +468,8 @@ class SenderApp(object):
             self._show_end_signal()
 
     def _prev_file(self, event=None):
+        if self._input_mode:
+            return
         if self.file_index > 0:
             self.file_index -= 1
             self._switch_file()
@@ -417,6 +480,7 @@ class SenderApp(object):
         self.paused = True
         if self.img_on_canvas is not None:
             self.canvas.delete(self.img_on_canvas)
+            self.img_on_canvas = None
 
         end_payload = encode_end_signal()
         qr = qrcode.QRCode(
@@ -440,86 +504,142 @@ class SenderApp(object):
         if self._end_countdown > 0:
             self.status_var.set("END — closing in {}s...".format(self._end_countdown))
             self._end_countdown -= 1
-            self.root.after(1000, self._end_tick)
+            self._after_id = self.root.after(1000, self._end_tick)
         else:
             self.root.destroy()
 
     def _toggle_pause(self, event=None):
+        if self._input_mode:
+            return
         self.paused = not self.paused
         if self.paused:
+            if self.file_index not in self.file_cache:
+                self.status_var.set("PAUSED (loading...)")
+                return
             info = self._current_info()
             self.status_var.set("[{}]  PAUSED  chunk {}/{}".format(
                 info["sid"], self.current_chunk + 1, info["total"]
             ))
 
     def _speed_up(self, event=None):
+        if self._input_mode:
+            return
         self.fps = min(self.fps + 1, 30)
         self.interval = int(1000 / self.fps)
 
     def _slow_down(self, event=None):
+        if self._input_mode:
+            self._on_key(event)
+            return
         self.fps = max(self.fps - 1, 1)
         self.interval = int(1000 / self.fps)
 
     def _on_key(self, event):
         ch = event.char
-        if not ch:
+        ks = event.keysym
+        is_return = ch in ('\r', '\n') or ks in ('Return', 'KP_Enter')
+        is_end = ch == '.' or is_return
+        if not ch and not is_end:
             return
-        if ch == 'm' and not self._input_mode:
+        if ch in ('m', 'a') and not self._input_mode and self.file_index in self.file_cache:
             self._input_mode = True
+            self._input_replace = (ch == 'm')
             self._input_buffer = ""
+            self._input_timeout_id = self.root.after(
+                15000, self._input_mode_timeout)
             self.status_var.set("[INPUT] receiving missing frames...")
             return "break"
         if self._input_mode:
-            if ch in '0123456789,':
+            if ch in '0123456789,-':
                 self._input_buffer += ch
                 return "break"
-            if ch in ('\r', '\n'):
+            if is_end:
+                if self._input_timeout_id is not None:
+                    self.root.after_cancel(self._input_timeout_id)
+                    self._input_timeout_id = None
                 self._parse_missing_input(self._input_buffer)
                 self._input_mode = False
                 self._input_buffer = ""
                 return "break"
             return "break"
 
+    def _input_mode_timeout(self):
+        if not self._input_mode:
+            return
+        print("[missing] Input mode timeout (15s), forcing parse")
+        self._parse_missing_input(self._input_buffer)
+        self._input_mode = False
+        self._input_buffer = ""
+        self._input_timeout_id = None
+
     def _parse_missing_input(self, raw):
         parts = raw.split(',')
         parts = [p for p in parts if p]
         if not parts or len(parts) % 2 != 0:
-            print("[missing] Invalid input (odd count): {}".format(raw))
+            preview = raw[:200] + ("..." if len(raw) > 200 else "")
+            print("[missing] Invalid input ({} parts, odd): {}".format(
+                len(parts), preview))
             self.status_var.set("[ERROR] invalid missing frame data")
             return
         half = len(parts) // 2
         first_half = parts[:half]
         second_half = parts[half:]
         if first_half != second_half:
-            print("[missing] Verification failed: {} vs {}".format(first_half, second_half))
+            print("[missing] Verification failed (halves differ)")
             self.status_var.set("[ERROR] missing frame verification failed")
             return
         info = self._current_info()
         total = info["total"]
         frames = []
         for s in first_half:
-            try:
-                n = int(s)
-            except ValueError:
-                print("[missing] Non-integer frame: {}".format(s))
-                self.status_var.set("[ERROR] invalid frame number")
-                return
-            if 0 <= n < total:
-                frames.append(n)
+            if '-' in s:
+                try:
+                    a, b = s.split('-', 1)
+                    for n in range(int(a), int(b) + 1):
+                        if 0 <= n < total:
+                            frames.append(n)
+                except ValueError:
+                    print("[missing] Invalid range: {}".format(s))
+                    self.status_var.set("[ERROR] invalid range")
+                    return
             else:
-                print("[missing] Frame {} out of range (0-{})".format(n, total - 1))
+                try:
+                    n = int(s)
+                except ValueError:
+                    print("[missing] Non-integer frame: {}".format(s))
+                    self.status_var.set("[ERROR] invalid frame number")
+                    return
+                if 0 <= n < total:
+                    frames.append(n)
+                else:
+                    print("[missing] Frame {} out of range (0-{})".format(n, total - 1))
         if not frames:
-            print("[missing] No valid frames, back to normal mode")
-            self._missing_frames = None
+            if self._missing_frames is None:
+                print("[missing] No valid frames")
             return
-        self._missing_frames = frames
-        self._missing_pos = 0
-        self._cancel_pending()
-        self.paused = False
-        print("[missing] Retransmit mode: {} frames {}".format(len(frames), frames))
-        self._show_frame()
+        if not self._input_replace and self._missing_frames is not None:
+            existing = set(self._missing_frames)
+            new_frames = [f for f in frames if f not in existing]
+            if new_frames:
+                self._missing_frames.extend(new_frames)
+                print("[missing] Appended: +{} new, total {} frames".format(
+                    len(new_frames), len(self._missing_frames)))
+            else:
+                print("[missing] Append batch: no new frames (total {})".format(
+                    len(self._missing_frames)))
+        else:
+            self._missing_frames = frames
+            self._missing_pos = 0
+            self._cancel_pending()
+            self.paused = False
+            print("[missing] Retransmit mode: {} frames".format(len(frames)))
+            self._show_frame()
 
     def _goto_frame(self, event=None):
+        if self._input_mode:
+            return
+        if self.file_index not in self.file_cache:
+            return
         was_paused = self.paused
         self.paused = True
         info = self._current_info()
@@ -543,7 +663,9 @@ class SenderApp(object):
             self.paused = was_paused
 
     def _quit(self, event=None):
+        _stop_event.set()
         self.root.destroy()
+        os._exit(0)
 
     def _on_resize(self, event=None):
         if self.img_on_canvas is not None:
