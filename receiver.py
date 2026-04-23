@@ -23,6 +23,7 @@ import termios
 import threading
 import time
 import tty
+from collections import deque
 import tkinter as tk
 
 if platform.system() == "Darwin":
@@ -41,10 +42,286 @@ import mss
 import numpy as np
 from pyzbar.pyzbar import decode as _pyzbar_decode_raw, ZBarSymbol
 
-from protocol import decode_chunk, is_end_signal
+from protocol import decode_chunk, decode_chunk_verbose, is_end_signal
 
 _thread_local = threading.local()
 _receiver_verbose = False
+
+
+class SpeedTracker(object):
+    """Rolling-window speed tracker for received data."""
+
+    def __init__(self, window=3.0):
+        self._window = window
+        self._samples = deque()
+        self._total_bytes = 0
+        self._start_time = None
+
+    def add(self, nbytes):
+        now = time.time()
+        if self._start_time is None:
+            self._start_time = now
+        self._samples.append((now, nbytes))
+        self._total_bytes += nbytes
+        cutoff = now - self._window
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def speed_kbps(self):
+        if not self._samples:
+            return 0.0
+        now = time.time()
+        window_start = self._samples[0][0]
+        window_elapsed = now - window_start
+        if window_elapsed < 0.1:
+            if self._start_time is None:
+                return 0.0
+            total_elapsed = now - self._start_time
+            return self._total_bytes / max(total_elapsed, 0.1) / 1024.0
+        window_bytes = sum(b for _, b in self._samples)
+        return window_bytes / window_elapsed / 1024.0
+
+    def reset(self):
+        self._samples.clear()
+        self._total_bytes = 0
+        self._start_time = None
+
+
+class PipelineStats:
+    """Thread-safe rolling-window FPS counters for each pipeline stage."""
+
+    def __init__(self, window=2.0):
+        self._window = window
+        self._lock = threading.Lock()
+        self._counters = {}  # name -> deque of timestamps
+
+    def tick(self, name):
+        now = time.time()
+        with self._lock:
+            if name not in self._counters:
+                self._counters[name] = deque()
+            dq = self._counters[name]
+            dq.append(now)
+            cutoff = now - self._window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+    def fps(self, name):
+        now = time.time()
+        with self._lock:
+            dq = self._counters.get(name)
+            if not dq:
+                return 0.0
+            cutoff = now - self._window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                return 0.0
+            span = now - dq[0]
+            if span < 0.05:
+                return 0.0
+            return len(dq) / span
+
+    def summary(self):
+        parts = []
+        for n in ("capture", "decode_ok", "dup", "crc_fail", "decode_fail"):
+            f = self.fps(n)
+            if f > 0 or n == "decode_ok":
+                label = n.replace("_", " ")
+                parts.append("{}={:.1f}".format(label, f))
+        return "  ".join(parts)
+
+
+_pipeline_stats = PipelineStats()
+
+
+class SessionLog:
+    """Records detailed events during a transfer session for post-run analysis."""
+
+    def __init__(self, outdir="received"):
+        self._outdir = outdir
+        self._global_start = time.time()
+        self._sessions = []      # list of completed session reports
+        self._cur = None         # current session dict
+
+    def begin_session(self, sid, filename, total):
+        if self._cur is not None and self._cur["sid"] != sid:
+            self._finalize_current("interrupted")
+        self._cur = {
+            "sid": sid,
+            "filename": filename,
+            "total": total,
+            "t_start": time.time(),
+            "t_end": None,
+            "chunks_received": {},    # idx -> (timestamp, byte_len)
+            "decode_fail_frames": [], # (frame_num, timestamp)
+            "crc_fail_frames": [],    # (frame_num, timestamp, detail)
+            "dup_frames": [],         # (frame_num, timestamp, idx)
+            "cycles": [],             # (timestamp, dup_idx, gap_s, missing_count)
+            "resends": [],            # (timestamp, trigger, missing_indices)
+            "status": "in_progress",
+        }
+
+    def chunk_ok(self, idx, data_len, frame_num=None):
+        if self._cur is None:
+            return
+        self._cur["chunks_received"][idx] = (time.time(), data_len, frame_num)
+
+    def chunk_dup(self, idx, frame_num=None):
+        if self._cur is None:
+            return
+        self._cur["dup_frames"].append((frame_num, time.time(), idx))
+
+    def decode_fail(self, frame_num):
+        if self._cur is None:
+            return
+        self._cur["decode_fail_frames"].append((frame_num, time.time()))
+
+    def crc_fail(self, frame_num, detail=""):
+        if self._cur is None:
+            return
+        self._cur["crc_fail_frames"].append((frame_num, time.time(), detail))
+
+    def cycle_detected(self, dup_idx, gap_s, missing_count):
+        if self._cur is None:
+            return
+        self._cur["cycles"].append((time.time(), dup_idx, gap_s, missing_count))
+
+    def resend_triggered(self, trigger, missing_indices):
+        if self._cur is None:
+            return
+        self._cur["resends"].append((time.time(), trigger, list(missing_indices)))
+
+    def end_session(self, status="complete"):
+        self._finalize_current(status)
+
+    def _finalize_current(self, status):
+        if self._cur is None:
+            return
+        self._cur["t_end"] = time.time()
+        self._cur["status"] = status
+        self._sessions.append(self._cur)
+        self._cur = None
+
+    def generate_report(self):
+        if self._cur is not None:
+            self._finalize_current("interrupted")
+
+        lines = []
+        lines.append("=" * 72)
+        lines.append("  QR Air Gap — Session Report")
+        lines.append("  Generated: {}".format(
+            time.strftime("%Y-%m-%d %H:%M:%S")))
+        total_elapsed = time.time() - self._global_start
+        lines.append("  Total run time: {:.1f}s".format(total_elapsed))
+        lines.append("=" * 72)
+
+        pipe_summary = _pipeline_stats.summary()
+        if pipe_summary:
+            lines.append("\nPipeline (last window): {}".format(pipe_summary))
+
+        if not self._sessions:
+            lines.append("\nNo sessions recorded.")
+            return "\n".join(lines)
+
+        for si, s in enumerate(self._sessions):
+            lines.append("\n" + "-" * 60)
+            lines.append("Session {}: [{}]  Status: {}".format(
+                si + 1, s["sid"], s["status"]))
+            lines.append("  File: {}".format(s["filename"] or "(unnamed)"))
+            lines.append("  Chunks: {}/{}".format(
+                len(s["chunks_received"]), s["total"]))
+            duration = (s["t_end"] or time.time()) - s["t_start"]
+            lines.append("  Duration: {:.1f}s".format(duration))
+
+            total_bytes = sum(v[1] for v in s["chunks_received"].values())
+            if duration > 0:
+                lines.append("  Throughput: {:.1f} KB/s".format(
+                    total_bytes / duration / 1024))
+            else:
+                lines.append("  Throughput: N/A")
+
+            # Missing chunks
+            if s["total"]:
+                missing = sorted(set(range(s["total"])) -
+                                 set(s["chunks_received"].keys()))
+                if missing:
+                    lines.append("\n  MISSING CHUNKS ({}):".format(len(missing)))
+                    lines.append("    {}".format(_encode_ranges(missing)))
+                else:
+                    lines.append("\n  All chunks received.")
+
+            # Decode failures
+            n_dfail = len(s["decode_fail_frames"])
+            if n_dfail:
+                lines.append("\n  DECODE FAILURES: {} frames".format(n_dfail))
+                if n_dfail <= 50:
+                    frames_list = [str(f[0]) for f in s["decode_fail_frames"]]
+                    lines.append("    Frames: {}".format(", ".join(frames_list)))
+                else:
+                    first5 = [str(f[0]) for f in s["decode_fail_frames"][:5]]
+                    last5 = [str(f[0]) for f in s["decode_fail_frames"][-5:]]
+                    lines.append("    First 5: {}".format(", ".join(first5)))
+                    lines.append("    Last  5: {}".format(", ".join(last5)))
+
+            # CRC failures
+            n_crc = len(s["crc_fail_frames"])
+            if n_crc:
+                lines.append("\n  CRC FAILURES: {} frames".format(n_crc))
+                for f_num, ts, detail in s["crc_fail_frames"][:20]:
+                    t_rel = ts - s["t_start"]
+                    lines.append("    frame #{} @ {:.1f}s  {}".format(
+                        f_num, t_rel, detail))
+                if n_crc > 20:
+                    lines.append("    ... and {} more".format(n_crc - 20))
+
+            # Duplicate frames
+            n_dup = len(s["dup_frames"])
+            if n_dup:
+                lines.append("\n  DUPLICATE CHUNKS decoded: {}".format(n_dup))
+
+            # Cycle detections
+            if s["cycles"]:
+                lines.append("\n  CYCLE DETECTIONS: {}".format(len(s["cycles"])))
+                for ts, dup_idx, gap, miss_c in s["cycles"]:
+                    t_rel = ts - s["t_start"]
+                    lines.append("    @ {:.1f}s  dup chunk={} gap={:.0f}s "
+                                 "missing={}".format(t_rel, dup_idx, gap, miss_c))
+
+            # Resend requests
+            if s["resends"]:
+                lines.append("\n  RESEND REQUESTS: {}".format(len(s["resends"])))
+                for ts, trigger, idxs in s["resends"]:
+                    t_rel = ts - s["t_start"]
+                    lines.append("    @ {:.1f}s  trigger={}  frames={}".format(
+                        t_rel, trigger, _encode_ranges(idxs)))
+
+            # Chunk receive timeline (first & last)
+            if s["chunks_received"]:
+                by_time = sorted(s["chunks_received"].items(),
+                                 key=lambda kv: kv[1][0])
+                first_t = by_time[0][1][0] - s["t_start"]
+                last_t = by_time[-1][1][0] - s["t_start"]
+                lines.append("\n  TIMELINE:")
+                lines.append("    First chunk: idx={} @ {:.1f}s".format(
+                    by_time[0][0], first_t))
+                lines.append("    Last  chunk: idx={} @ {:.1f}s".format(
+                    by_time[-1][0], last_t))
+
+        lines.append("\n" + "=" * 72)
+        return "\n".join(lines)
+
+    def save_report(self, path=None):
+        report = self.generate_report()
+        if path is None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self._outdir, "session_{}.log".format(ts))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(report)
+        print(report)
+        print("\nReport saved to: {}".format(path))
+        return path
 
 
 def _get_cv2_qr_detector():
@@ -296,7 +573,45 @@ def try_decode_qr(frame_bgr):
     return None
 
 
-def print_progress(sid, received_count, total, fps, filename=""):
+def try_decode_qr_multi(frame_bgr):
+    """Decode ALL QR codes in the frame (for multi-QR mode)."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    seen = set()
+    texts = []
+
+    def _collect_pyzbar(img):
+        for r in pyzbar_decode(img):
+            t = r.data.decode("utf-8", errors="replace")
+            if t not in seen:
+                texts.append(t)
+                seen.add(t)
+
+    def _collect_cv2_multi(img):
+        try:
+            detector = _get_cv2_qr_detector()
+            retval, decoded_info, *_ = detector.detectAndDecodeMulti(img)
+            if retval and decoded_info is not None:
+                for t in decoded_info:
+                    if t and t not in seen:
+                        texts.append(t)
+                        seen.add(t)
+        except (AttributeError, cv2.error, Exception):
+            pass
+
+    _collect_pyzbar(gray)
+    _collect_cv2_multi(gray)
+
+    if not texts:
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 11
+        )
+        _collect_pyzbar(thresh)
+        _collect_cv2_multi(thresh)
+
+    return texts if texts else None
+
+
+def print_progress(sid, received_count, total, fps, filename="", speed_kbps=0.0):
     bar_len = 30
     filled = int(bar_len * received_count / total) if total else 0
     bar = "#" * filled + "-" * (bar_len - filled)
@@ -305,8 +620,10 @@ def print_progress(sid, received_count, total, fps, filename=""):
         term_width = os.get_terminal_size().columns
     except (AttributeError, ValueError, OSError):
         term_width = 120
-    content = "[{}] [{}] {}/{} ({:.0f}%) @{}fps".format(
-        sid, bar, received_count, total, pct, int(fps)
+    speed_str = " {:.1f}KB/s".format(speed_kbps) if speed_kbps > 0 else ""
+    pipe = _pipeline_stats.summary()
+    content = "[{}] [{}] {}/{} ({:.0f}%){}  {}".format(
+        sid, bar, received_count, total, pct, speed_str, pipe
     )
     if filename:
         max_name = term_width - len(content) - 4
@@ -524,6 +841,77 @@ def _save_file(received, total, filename, outdir):
     return outpath
 
 
+import re as _re
+
+_PART_RE = _re.compile(r'^(.+)\.part(\d+)of(\d+)$')
+_PART_RE_LEGACY = _re.compile(r'^(.+)\.part(\d+)$')
+
+
+def _try_merge_parts(outdir, filename):
+    """If filename is a .partNofM, check if all M parts exist and merge them.
+
+    New format: <base>.part01of03, .part02of03, .part03of03 (1-based).
+    Legacy format: <base>.part01, .part02, ... (no total — never auto-merge).
+
+    Returns True if merge succeeded, False otherwise.
+    """
+    m = _PART_RE.match(filename)
+    if not m:
+        ml = _PART_RE_LEGACY.match(filename)
+        if ml:
+            print("[merge] Legacy part format (no total) — skipping auto-merge")
+        return False
+    base = m.group(1)
+    total_parts = int(m.group(3))
+    safe_base = _safe_filename(base)
+    if not safe_base:
+        return False
+    parent_dir = os.path.dirname(os.path.join(outdir, _safe_filename(filename) or filename))
+
+    part_files = {}
+    for entry in os.listdir(parent_dir):
+        pm = _PART_RE.match(entry)
+        if pm and pm.group(1) == os.path.basename(safe_base):
+            part_num = int(pm.group(2))
+            file_total = int(pm.group(3))
+            if file_total == total_parts:
+                part_files[part_num] = os.path.join(parent_dir, entry)
+
+    if not part_files:
+        return False
+
+    expected = set(range(1, total_parts + 1))
+    if set(part_files.keys()) != expected:
+        have = sorted(part_files.keys())
+        want = sorted(expected - set(part_files.keys()))
+        print("[merge] Waiting for parts: have {}/{}, missing {}".format(
+            len(have), total_parts, want))
+        return False
+
+    merged_path = os.path.join(parent_dir, os.path.basename(safe_base))
+    print("[merge] All {} parts found, merging → {}".format(
+        total_parts, merged_path))
+    total_size = 0
+    with open(merged_path, "wb") as out:
+        for i in range(1, total_parts + 1):
+            pf = part_files[i]
+            sz = os.path.getsize(pf)
+            total_size += sz
+            with open(pf, "rb") as inp:
+                while True:
+                    chunk = inp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+    print("[merge] Done: {} ({} B from {} parts)".format(
+        merged_path, total_size, total_parts))
+
+    for i in range(1, total_parts + 1):
+        os.remove(part_files[i])
+    print("[merge] Removed {} part files".format(total_parts))
+    return True
+
+
 def _capture_thread(region, frame_queue, stop_event, interval, debug):
     """Producer: captures screen frames at the given rate."""
     frame_count = 0
@@ -534,6 +922,7 @@ def _capture_thread(region, frame_queue, stop_event, interval, debug):
             frame = np.array(screenshot)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             frame_count += 1
+            _pipeline_stats.tick("capture")
 
             if debug and frame_count <= 20:
                 path = "debug_frames/frame_{:04d}.png".format(frame_count)
@@ -550,16 +939,36 @@ def _capture_thread(region, frame_queue, stop_event, interval, debug):
                 time.sleep(sleep_time)
 
 
-def _decode_thread(frame_queue, result_queue, stop_event):
-    """Consumer: decodes QR codes from captured frames."""
+def _decode_thread(frame_queue, result_queue, stop_event, multi_qr=False,
+                   grid_w=160, grid_h=96, n_levels=4, n_colors=1):
+    """Consumer: decodes QR codes (or V3 visual frames) from captured frames."""
     while not stop_event.is_set():
         try:
             item = frame_queue.get(timeout=0.1)
         except queue.Empty:
             continue
         frame_num, frame_bgr = item
-        raw_text = try_decode_qr(frame_bgr)
-        result_queue.put((frame_num, frame_bgr.shape[:2], raw_text))
+
+        if multi_qr:
+            texts = try_decode_qr_multi(frame_bgr)
+        else:
+            text = try_decode_qr(frame_bgr)
+            texts = [text] if text else None
+
+        if texts:
+            result_queue.put((frame_num, frame_bgr.shape[:2], texts))
+            continue
+
+        try:
+            from visual_transport import decode_frame, is_calib_marker
+            raw = decode_frame(frame_bgr, grid_w, grid_h, n_levels, n_colors)
+            if raw is not None:
+                result_queue.put((frame_num, frame_bgr.shape[:2], [raw]))
+                continue
+        except Exception:
+            pass
+
+        result_queue.put((frame_num, frame_bgr.shape[:2], None))
 
 
 def main():
@@ -582,17 +991,38 @@ def main():
                         help="Number of decode threads (default: 2)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show detailed processing steps")
+    parser.add_argument("--num-qr", type=int, default=1,
+                        help="[experimental] Number of QR codes per frame (default: 1)")
+    parser.add_argument("--grid", type=str, default="160,96",
+                        help="Expected data grid W,H for V3 grayN decoding (default: 160,96)")
+    parser.add_argument("--gray-levels", type=int, default=4, choices=[4, 8],
+                        help="Number of gray levels for V3 decoding (default: 4). "
+                             "Auto-detected from calibration frame if sender sends one.")
+    parser.add_argument("--colors", type=int, default=1, choices=[1, 2, 4],
+                        help="Number of color channels for V3 decoding (default: 1). "
+                             "Auto-detected from calibration frame if sender sends one.")
     args = parser.parse_args()
 
     global _receiver_verbose
     _receiver_verbose = args.verbose
 
+    import re
+    _grid_parts = re.split(r'[x,\s]+', args.grid.strip().lower())
+    try:
+        if len(_grid_parts) != 2:
+            raise ValueError
+        _grid_w, _grid_h = int(_grid_parts[0]), int(_grid_parts[1])
+    except ValueError:
+        print("Error: --grid must be W,H (e.g. 160,96 or 160x96)")
+        sys.exit(1)
+
     print("=== QR Air Gap Receiver ===")
 
     if not _startup_check():
-        print("ERROR: pyzbar cannot decode QR codes. Check zbar installation.")
+        print("WARNING: pyzbar cannot decode QR codes. Check zbar installation.")
         print("  macOS: brew install zbar")
-        sys.exit(1)
+        print("  V3 grayN decoding will still work, but QR (V1/V2) will not.")
+        print()
 
     if args.region:
         parts = [int(x) for x in args.region.split(",")]
@@ -625,19 +1055,26 @@ def main():
         args=(region, frame_queue, stop_event, interval, args.debug),
         daemon=True,
     )
+    multi_qr = args.num_qr > 1
+    _n_levels = args.gray_levels
+    _n_colors = args.colors
     decode_threads = []
     for _ in range(args.decode_workers):
         t = threading.Thread(
             target=_decode_thread,
-            args=(frame_queue, result_queue, stop_event),
+            args=(frame_queue, result_queue, stop_event, multi_qr,
+                  _grid_w, _grid_h, _n_levels, _n_colors),
             daemon=True,
         )
         decode_threads.append(t)
 
-    print("Capturing at {:.1f} fps, {} decode workers. Press q to stop.\n".format(
-        args.fps, args.decode_workers
+    multi_label = ", {} QR codes/frame".format(args.num_qr) if multi_qr else ""
+    print("Capturing at {:.1f} fps, {} decode workers{}. Press q to stop.\n".format(
+        args.fps, args.decode_workers, multi_label
     ))
 
+    speed_tracker = SpeedTracker()
+    # slog = SessionLog(args.outdir)
     files_saved = []
     received = {}
     session_id = None
@@ -648,7 +1085,9 @@ def main():
     decode_fail_count = 0
     end_received = False
     completed_sids = set()
-    last_decoded_idx = -1
+    chunk_last_seen = {}  # idx -> timestamp of last decode
+    _CYCLE_GAP = 10.0     # seconds: dup gap threshold for cycle detection
+    _calib_done = False   # True after first calibration frame detected
 
     old_settings = termios.tcgetattr(sys.stdin)
     try:
@@ -667,118 +1106,193 @@ def main():
             batch_count = 0
             while batch_count < 20:
                 try:
-                    frame_num, shape, raw_text = result_queue.get_nowait()
+                    frame_num, shape, raw_texts = result_queue.get_nowait()
                 except queue.Empty:
                     break
                 batch_count += 1
 
-                if raw_text is None:
+                if not raw_texts:
                     decode_fail_count += 1
+                    _pipeline_stats.tick("decode_fail")
+                    # slog.decode_fail(frame_num)
                     if decode_fail_count <= 3 or decode_fail_count % 50 == 0:
                         h, w = shape
                         try:
                             tw = os.get_terminal_size().columns
                         except (AttributeError, ValueError, OSError):
                             tw = 120
-                        msg = "[scan] frame #{} ({}x{}) — no QR ({} fails)".format(
-                            frame_num, w, h, decode_fail_count
+                        pipe = _pipeline_stats.summary()
+                        msg = "[scan] #{} ({}x{}) no decode ({}x)  {}".format(
+                            frame_num, w, h, decode_fail_count, pipe
                         )
                         sys.stdout.write("\r" + msg.ljust(tw - 1))
                         sys.stdout.flush()
                     continue
 
-                if is_end_signal(raw_text):
-                    print("\n\nEND signal received — sender has finished all files.")
-                    end_received = True
+                for raw_item in raw_texts:
+                    if isinstance(raw_item, bytes):
+                        from visual_transport import (is_v3_end_packet, decode_v3_packet,
+                                                      is_calib_marker)
+                        if is_calib_marker(raw_item):
+                            if not _calib_done:
+                                _calib_done = True
+                                sys.stdout.write("\r\033[2K")
+                                calib_label = "gray{}".format(_n_levels) if _n_colors == 1 else \
+                                    "{}c×gray{}".format(_n_colors, _n_levels)
+                                print("[CALIB] {} calibration OK, sending Space to sender".format(
+                                    calib_label))
+                                _send_keystroke_async(" ", delay=1.0)
+                            continue
+                        if is_v3_end_packet(raw_item):
+                            print("\n\nEND signal received — sender has finished all files.")
+                            end_received = True
+                            break
+                        chunk_info = decode_v3_packet(raw_item)
+                        if chunk_info is None:
+                            from visual_transport import diagnose_v3_packet
+                            diag = diagnose_v3_packet(raw_item)
+                            _pipeline_stats.tick("crc_fail")
+                            # slog.crc_fail(frame_num, diag)
+                            if _receiver_verbose:
+                                sys.stdout.write("\r\033[2K")
+                                print("[V3 FAIL] #{}: {} ({} B)".format(
+                                    frame_num, diag, len(raw_item)))
+                            continue
+                    else:
+                        raw_text = raw_item
+                        if is_end_signal(raw_text):
+                            print("\n\nEND signal received — sender has finished all files.")
+                            end_received = True
+                            break
+                        chunk_info = decode_chunk(raw_text)
+                        if chunk_info is None:
+                            # slog.crc_fail(frame_num, "QR decode fail")
+                            if _receiver_verbose or session_id is None:
+                                _, reason = decode_chunk_verbose(raw_text)
+                                preview = raw_text[:80] + ("..." if len(raw_text) > 80 else "")
+                                sys.stdout.write("\r\033[2K")
+                                print("[DECODE FAIL] {}\n  payload({} chars): {}".format(
+                                    reason, len(raw_text), preview))
+                            continue
+
+                    sid = chunk_info["sid"]
+                    idx = chunk_info["idx"]
+                    fname = chunk_info.get("filename", "")
+
+                    if sid in completed_sids:
+                        continue
+
+                    if session_id is None:
+                        session_id = sid
+                        total = chunk_info["total"]
+                        current_filename = fname
+                        chunk_last_seen.clear()
+                        speed_tracker.reset()
+                        # slog.begin_session(sid, fname, total)
+                        sys.stdout.write("\r\033[2K")
+                        print("Session detected: {}  File: {}  Chunks: {}".format(
+                            sid, fname or "(unnamed)", total
+                        ))
+
+                    if sid != session_id:
+                        # slog.end_session("interrupted")
+                        received = {}
+                        session_id = sid
+                        total = chunk_info["total"]
+                        current_filename = fname
+                        warned = False
+                        decode_fail_count = 0
+                        chunk_last_seen.clear()
+                        _calib_done = False
+                        speed_tracker.reset()
+                        # slog.begin_session(sid, fname, total)
+                        sys.stdout.write("\r\033[2K")
+                        print("\nNew session detected: {}  File: {}  Chunks: {}".format(
+                            sid, fname or "(unnamed)", total
+                        ))
+
+                    now = time.time()
+                    prev_seen = chunk_last_seen.get(idx)
+                    chunk_last_seen[idx] = now
+
+                    is_new = idx not in received
+                    if is_new:
+                        received[idx] = chunk_info["data"]
+                        speed_tracker.add(len(chunk_info["data"]))
+                        _pipeline_stats.tick("decode_ok")
+                        # slog.chunk_ok(idx, len(chunk_info["data"]), frame_num)
+                        last_new_time = now
+                        warned = False
+                        if total is not None:
+                            print_progress(session_id, len(received), total, args.fps,
+                                           current_filename, speed_tracker.speed_kbps())
+                    else:
+                        _pipeline_stats.tick("dup")
+                        # slog.chunk_dup(idx, frame_num)
+                        if (prev_seen is not None
+                              and now - prev_seen > _CYCLE_GAP
+                              and total is not None
+                              and len(received) < total
+                              and not _sending_missing):
+                            missing = sorted(set(range(total)) - set(received.keys()))
+                            if missing:
+                                gap = now - prev_seen
+                                # slog.cycle_detected(idx, gap, len(missing))
+                                missing_show = missing[:20]
+                                suffix = " ..." if len(missing) > 20 else ""
+                                print("\n[resend] Cycle detected (dup {} after {:.0f}s), "
+                                      "missing {} frames [{}{}]".format(
+                                          idx, gap, len(missing),
+                                          ", ".join(str(x) for x in missing_show), suffix))
+                                # slog.resend_triggered("cycle", missing)
+                                _send_missing_frames_async(missing)
+
+                    if total is not None and len(received) >= total:
+                        _save_file(received, total, current_filename, args.outdir)
+                        _try_merge_parts(args.outdir, current_filename)
+                        files_saved.append(current_filename or session_id)
+                        completed_sids.add(session_id)
+                        # slog.end_session("complete")
+
+                        received = {}
+                        session_id = None
+                        total = None
+                        current_filename = ""
+                        warned = False
+                        decode_fail_count = 0
+                        chunk_last_seen.clear()
+                        _calib_done = False
+
+                        if args.auto_next:
+                            print("Auto-sending 'n' to switch to next file...")
+                            _send_keystroke_async("n")
+                        print("Waiting for next file... (q to quit)\n")
+
+                if end_received:
                     break
-
-                chunk_info = decode_chunk(raw_text)
-                if chunk_info is None:
-                    continue
-
-                sid = chunk_info["sid"]
-                idx = chunk_info["idx"]
-                fname = chunk_info.get("filename", "")
-
-                if sid in completed_sids:
-                    continue
-
-                if session_id is None:
-                    session_id = sid
-                    total = chunk_info["total"]
-                    current_filename = fname
-                    last_decoded_idx = -1
-                    sys.stdout.write("\r\033[2K")
-                    print("Session detected: {}  File: {}  Chunks: {}".format(
-                        sid, fname or "(unnamed)", total
-                    ))
-
-                if sid != session_id:
-                    received = {}
-                    session_id = sid
-                    total = chunk_info["total"]
-                    current_filename = fname
-                    warned = False
-                    decode_fail_count = 0
-                    last_decoded_idx = -1
-                    sys.stdout.write("\r\033[2K")
-                    print("\nNew session detected: {}  File: {}  Chunks: {}".format(
-                        sid, fname or "(unnamed)", total
-                    ))
-
-                is_new = idx not in received
-                if is_new:
-                    received[idx] = chunk_info["data"]
-                    last_new_time = time.time()
-                    warned = False
-                    if total is not None:
-                        print_progress(session_id, len(received), total, args.fps, current_filename)
-
-                same_as_last = (idx == last_decoded_idx)
-                last_decoded_idx = idx
-
-                if not is_new and not same_as_last and total is not None and len(received) < total:
-                    if not _sending_missing:
-                        missing = sorted(set(range(total)) - set(received.keys()))
-                        if missing:
-                            missing_show = missing[:20]
-                            suffix = " ..." if len(missing) > 20 else ""
-                            print("\n[resend] Duplicate frame {} detected, missing {} frames [{}{}]".format(
-                                idx, len(missing),
-                                ", ".join(str(x) for x in missing_show), suffix))
-                            _send_missing_frames_async(missing)
-
-                if total is not None and len(received) >= total:
-                    _save_file(received, total, current_filename, args.outdir)
-                    files_saved.append(current_filename or session_id)
-                    completed_sids.add(session_id)
-
-                    received = {}
-                    session_id = None
-                    total = None
-                    current_filename = ""
-                    warned = False
-                    decode_fail_count = 0
-                    last_decoded_idx = -1
-
-                    if args.auto_next:
-                        print("Auto-sending 'n' to switch to next file...")
-                        _send_keystroke_async("n")
-                    print("Waiting for next file... (q to quit)\n")
 
             if end_received:
                 break
 
-            if session_id is not None and not warned:
-                if time.time() - last_new_time > args.timeout:
-                    remaining = set(range(total)) - set(received.keys())
-                    missing_str = ", ".join(str(x) for x in sorted(remaining)[:20])
-                    if len(remaining) > 20:
-                        missing_str += "..."
-                    print("\n[WARN] No new chunks for {:.0f}s. Missing: [{}]".format(
-                        args.timeout, missing_str
-                    ))
-                    warned = True
+            if session_id is not None and total is not None and len(received) < total:
+                now = time.time()
+                stall_duration = now - last_new_time
+
+                if stall_duration > args.timeout and not _sending_missing:
+                    missing = sorted(set(range(total)) - set(received.keys()))
+                    if missing:
+                        if not warned:
+                            print("\n[WARN] No new chunks for {:.0f}s. Missing {} frames.".format(
+                                stall_duration, len(missing)))
+                            warned = True
+                        missing_show = missing[:20]
+                        suffix = " ..." if len(missing) > 20 else ""
+                        print("\n[resend] Timeout ({:.0f}s no new), missing {} frames [{}{}]".format(
+                            stall_duration, len(missing),
+                            ", ".join(str(x) for x in missing_show), suffix))
+                        # slog.resend_triggered("timeout", missing)
+                        _send_missing_frames_async(missing)
+                        last_new_time = now
 
             time.sleep(0.02)
 
@@ -793,16 +1307,14 @@ def main():
 
     if received and total:
         _save_file(received, total, current_filename, args.outdir)
+        if len(received) >= total:
+            _try_merge_parts(args.outdir, current_filename)
+        else:
+            print("[info] Part incomplete ({}/{} chunks) — skipping merge".format(
+                len(received), total))
         files_saved.append(current_filename or session_id or "unknown")
 
-    print("\n=== Summary ===")
-    if files_saved:
-        print("Files received: {}".format(len(files_saved)))
-        for f in files_saved:
-            print("  - {}".format(f))
-    else:
-        print("No files received.")
-        print("Check debug_frames/frame_0001.png to verify the capture region.")
+    # slog.save_report()
 
 
 if __name__ == "__main__":
