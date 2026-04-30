@@ -58,6 +58,7 @@ FINDER_SIZE = 7
 GUARD = 1
 _SIDE = QUIET + FINDER_SIZE + GUARD   # 12
 FRAME_OVERHEAD = 2 * _SIDE            # 24
+_WARP_SCALE = 8
 
 # ---------------------------------------------------------------------------
 # Version byte mapping — (n_colors, n_levels) ↔ version byte
@@ -77,6 +78,24 @@ _VALID_LEVELS = {4, 8}
 _VALID_COLORS = {1, 2, 4}
 
 _CALIB_MARKER = b"__CALIB__"
+
+
+class CalibResult:
+    """Returned by FrameDecoder when a calibration frame is detected."""
+    __slots__ = ("n_colors", "n_levels")
+
+    def __init__(self, n_colors, n_levels):
+        self.n_colors = n_colors
+        self.n_levels = n_levels
+
+    def __eq__(self, other):
+        if isinstance(other, bytes):
+            return other == _CALIB_MARKER
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return not result if result is not NotImplemented else NotImplemented
 
 # Packing groups: bpm → (symbols_per_group, bytes_per_group)
 _PACK_GROUPS = {
@@ -367,8 +386,12 @@ def encode_frame(packet_bytes, grid_w=160, grid_h=96, module_size=4,
     pad = total_mods - len(syms)
     if pad > 0:
         syms = np.concatenate([syms, np.zeros(pad, dtype=np.uint8)])
-    else:
-        syms = syms[:total_mods]
+    elif pad < 0:
+        raise ValueError(
+            "V3 packet ({} B) exceeds frame capacity ({} B, grid {}x{}, bpm={})".format(
+                len(packet_bytes),
+                frame_capacity_bytes(grid_w, grid_h, n_levels, n_colors),
+                grid_w, grid_h, bpm))
 
     x0, y0 = _SIDE, _SIDE
     grid = syms.reshape(grid_h, grid_w).copy()
@@ -560,7 +583,7 @@ def _warp_and_sample_rgb(bgr, H_mat, grid_w, grid_h):
     import cv2
     fw = grid_w + FRAME_OVERHEAD
     fh = grid_h + FRAME_OVERHEAD
-    scale = 4
+    scale = _WARP_SCALE
     ww, wh = fw * scale, fh * scale
 
     warped = cv2.warpPerspective(bgr, H_mat, (ww, wh), flags=cv2.INTER_LINEAR)
@@ -601,8 +624,8 @@ def _warp_and_sample_rgb(bgr, H_mat, grid_w, grid_h):
     mx = (np.arange(grid_w) + x0).astype(np.float64)
     my = (np.arange(grid_h) + y0).astype(np.float64)
     mxx, myy = np.meshgrid(mx, my)
-    px_arr = np.clip((mxx * scale + scale / 2).astype(int), 0, ww - 1)
-    py_arr = np.clip((myy * scale + scale / 2).astype(int), 0, wh - 1)
+    px_arr = np.clip((mxx * scale + scale // 2).astype(int), 0, ww - 1)
+    py_arr = np.clip((myy * scale + scale // 2).astype(int), 0, wh - 1)
 
     # Sample RGB (warped is BGR)
     vals_b = warped[py_arr, px_arr, 0].astype(np.float32)
@@ -852,6 +875,32 @@ def _try_detect_calibration_color(vals_rgb, grid_w, grid_h, n_levels, n_colors):
 
 
 # ---------------------------------------------------------------------------
+# Shared calibration cache across all FrameDecoder instances (all threads)
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_shared_calib_lock = _threading.Lock()
+_shared_calib_cache = {}  # {(n_colors, n_levels): calibration_dict}
+
+
+def _shared_calib_store(nc, nl, cal):
+    with _shared_calib_lock:
+        _shared_calib_cache[(nc, nl)] = cal
+
+
+def _shared_calib_snapshot():
+    with _shared_calib_lock:
+        return dict(_shared_calib_cache)
+
+
+def clear_shared_calib_cache():
+    """Clear the shared calibration cache (e.g. for manual re-calibration)."""
+    with _shared_calib_lock:
+        _shared_calib_cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # Stateful decoder with homography caching + calibration
 # ---------------------------------------------------------------------------
 
@@ -859,6 +908,7 @@ class FrameDecoder:
     """Stateful frame decoder with homography caching and calibration.
 
     Supports gray-only (n_colors=1) and color (n_colors=2/4) modes.
+    Calibration data is shared across all instances via a module-level cache.
     """
 
     _RELOCATE_AFTER = 3
@@ -878,7 +928,7 @@ class FrameDecoder:
         fw = self.grid_w + FRAME_OVERHEAD
         fh = self.grid_h + FRAME_OVERHEAD
         fc = QUIET + FINDER_SIZE // 2
-        scale = 4
+        scale = _WARP_SCALE
         self._dst = np.array([
             [(fc + 0.5) * scale, (fc + 0.5) * scale],
             [(fw - fc - 0.5) * scale, (fc + 0.5) * scale],
@@ -896,52 +946,110 @@ class FrameDecoder:
         self._consec_fail = 0
         return H_mat
 
+    def _classify_with_params(self, vals_rgb, nc, nl, cal):
+        """Classify pixels using specific (n_colors, n_levels, calibration)."""
+        if nc == 1:
+            vals_gray = (vals_rgb[:, :, 0] + vals_rgb[:, :, 1] + vals_rgb[:, :, 2]) / 3.0
+            return _classify_gray_only(
+                vals_gray, self.grid_w, self.grid_h, nl, cal)
+        return _classify_color(
+            vals_rgb, self.grid_w, self.grid_h, nl, nc, cal)
+
+    @staticmethod
+    def _crc_ok(raw):
+        """Check if raw bytes form a valid V3 packet (CRC matches)."""
+        if not raw or len(raw) < V3_HEADER_SIZE:
+            return False
+        try:
+            ver, sid_b, idx, total, exp_crc, fnlen, dlen = _V3_FMT.unpack(
+                raw[:V3_HEADER_SIZE])
+        except struct.error:
+            return False
+        if ver not in _VER_INV:
+            return False
+        fn_end = V3_HEADER_SIZE + fnlen
+        d_end = fn_end + dlen
+        if d_end > len(raw):
+            return False
+        payload = raw[fn_end:d_end]
+        return binascii.crc32(payload) & 0xFFFFFFFF == exp_crc
+
     def _try_decode_with_H(self, bgr, gray, H_mat):
-        """Warp, sample, then try calibration detection or data decode."""
+        """Warp, sample, then try calibration detection or data decode.
+
+        When a data decode CRC fails, cached calibrations for other
+        protocols are tried before giving up.
+        """
         result = _warp_and_sample_rgb(bgr, H_mat, self.grid_w, self.grid_h)
         if result is None:
             return None
         vals_rgb, lo, hi = result
 
-        # Try calibration detection
-        for nc in (self.n_colors,) if self.n_colors > 1 else (1,):
-            if nc == 1:
-                vals_gray = (vals_rgb[:, :, 0] + vals_rgb[:, :, 1] + vals_rgb[:, :, 2]) / 3.0
-                cal = _try_detect_calibration_gray(vals_gray, self.grid_h, self.n_levels)
-            else:
-                cal = _try_detect_calibration_color(
-                    vals_rgb, self.grid_w, self.grid_h, self.n_levels, nc)
-            if cal is not None:
-                self._calibration = cal
-                self.n_colors = cal["n_colors"]
-                self.n_levels = cal["n_levels"]
-                return _CALIB_MARKER
+        # Try calibration detection with fallbacks for both n_colors and n_levels
+        color_candidates = [self.n_colors]
+        if self.n_colors > 1:
+            color_candidates.append(1)
+        level_candidates = [self.n_levels]
+        if self.n_levels != 4:
+            level_candidates.append(4)
+        if self.n_levels != 8:
+            level_candidates.append(8)
+        for nc in color_candidates:
+            for nl in level_candidates:
+                if nc == 1:
+                    vals_gray = (vals_rgb[:, :, 0] + vals_rgb[:, :, 1] + vals_rgb[:, :, 2]) / 3.0
+                    cal = _try_detect_calibration_gray(vals_gray, self.grid_h, nl)
+                else:
+                    cal = _try_detect_calibration_color(
+                        vals_rgb, self.grid_w, self.grid_h, nl, nc)
+                if cal is not None:
+                    self._calibration = cal
+                    _shared_calib_store(cal["n_colors"], cal["n_levels"], cal)
+                    self.n_colors = cal["n_colors"]
+                    self.n_levels = cal["n_levels"]
+                    return CalibResult(cal["n_colors"], cal["n_levels"])
 
-        # Data decode
-        if self.n_colors == 1:
-            vals_gray = (vals_rgb[:, :, 0] + vals_rgb[:, :, 1] + vals_rgb[:, :, 2]) / 3.0
-            return _classify_gray_only(
-                vals_gray, self.grid_w, self.grid_h,
-                self.n_levels, self._calibration)
+        # Data decode with current params
+        raw = self._classify_with_params(
+            vals_rgb, self.n_colors, self.n_levels, self._calibration)
 
-        raw = _classify_color(
-            vals_rgb, self.grid_w, self.grid_h,
-            self.n_levels, self.n_colors, self._calibration)
-
-        # Fallback: the sender encodes END frames as gray-only (n_colors=1)
-        # to survive JPEG chroma subsampling, so try a gray-only decode when
-        # the color decode doesn't yield a valid END packet.
-        if raw is not None and not is_v3_end_packet(raw):
+        # Check END frame fallback for color modes
+        if raw is not None and self.n_colors > 1 and not is_v3_end_packet(raw):
             gray_cal = None
             if self._calibration is not None and "c0" in self._calibration:
                 gray_cal = {"gray": self._calibration["c0"],
                             "n_colors": 1, "n_levels": self.n_levels}
-            vals_gray = (vals_rgb[:, :, 0] + vals_rgb[:, :, 1] + vals_rgb[:, :, 2]) / 3.0
-            raw_end = _classify_gray_only(
-                vals_gray, self.grid_w, self.grid_h,
-                self.n_levels, gray_cal)
+            raw_end = self._classify_with_params(vals_rgb, 1, self.n_levels, gray_cal)
             if is_v3_end_packet(raw_end):
                 return raw_end
+
+        # If CRC passes with current params, return immediately
+        if raw is not None and self._crc_ok(raw):
+            return raw
+
+        # CRC failed — try other cached calibrations (shared across threads)
+        for (cc_nc, cc_nl), cc_cal in _shared_calib_snapshot().items():
+            if (cc_nc, cc_nl) == (self.n_colors, self.n_levels):
+                continue
+            alt_raw = self._classify_with_params(vals_rgb, cc_nc, cc_nl, cc_cal)
+            if alt_raw is not None and self._crc_ok(alt_raw):
+                self.n_colors = cc_nc
+                self.n_levels = cc_nl
+                self._calibration = cc_cal
+                return alt_raw
+
+            # Also try END packet decode for color alternatives
+            if cc_nc > 1 and alt_raw is not None and not is_v3_end_packet(alt_raw):
+                alt_gray_cal = None
+                if cc_cal is not None and "c0" in cc_cal:
+                    alt_gray_cal = {"gray": cc_cal["c0"],
+                                    "n_colors": 1, "n_levels": cc_nl}
+                alt_end = self._classify_with_params(vals_rgb, 1, cc_nl, alt_gray_cal)
+                if is_v3_end_packet(alt_end):
+                    self.n_colors = cc_nc
+                    self.n_levels = cc_nl
+                    self._calibration = cc_cal
+                    return alt_end
 
         return raw
 
@@ -972,7 +1080,7 @@ class FrameDecoder:
 
 
 def is_calib_marker(raw):
-    return raw == _CALIB_MARKER
+    return isinstance(raw, CalibResult) or raw == _CALIB_MARKER
 
 
 def decode_frame(frame_bgr, grid_w=160, grid_h=96, n_levels=4, n_colors=1):

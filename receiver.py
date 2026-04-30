@@ -539,10 +539,13 @@ def try_decode_qr(frame_bgr):
         _decode_stats["fast_ok"] += 1
         return results[0].data.decode("utf-8", errors="replace")
 
-    text, _, _ = _get_cv2_qr_detector().detectAndDecode(gray)
-    if text:
-        _decode_stats["fast_ok"] += 1
-        return text
+    try:
+        text, _, _ = _get_cv2_qr_detector().detectAndDecode(gray)
+        if text:
+            _decode_stats["fast_ok"] += 1
+            return text
+    except cv2.error:
+        pass
 
     thresh = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 11
@@ -802,6 +805,56 @@ def _send_missing_frames_async(missing_indices, delay=0.3, max_csv_len=200):
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _is_calib_result(obj):
+    from visual_transport import CalibResult
+    return isinstance(obj, CalibResult)
+
+
+def _send_alert_email(alert_cfg, filename, progress, total, stall_secs):
+    """Send a stall alert email via SMTP in a background thread."""
+    email_addr = alert_cfg.get("email", "")
+    if not email_addr:
+        return
+    def _do():
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            subject = "[QRAirGap] Stall alert: {} ({}/{})".format(
+                filename or "unknown", progress, total or "?")
+            body = (
+                "QRAirGap receiver has not received new frames for {:.0f} seconds.\n\n"
+                "File: {}\n"
+                "Progress: {}/{} chunks\n"
+                "Missing: {} chunks\n"
+            ).format(stall_secs, filename or "(unnamed)", progress, total or "?",
+                     (total - progress) if total else "?")
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = alert_cfg.get("smtp_user", email_addr)
+            msg["To"] = email_addr
+
+            server = alert_cfg.get("smtp_server", "")
+            port = int(alert_cfg.get("smtp_port", 587))
+            user = alert_cfg.get("smtp_user", "")
+            password = alert_cfg.get("smtp_password", "")
+            use_tls = alert_cfg.get("smtp_use_tls", True)
+
+            if port == 465 and not use_tls:
+                conn = smtplib.SMTP_SSL(server, port, timeout=30)
+            else:
+                conn = smtplib.SMTP(server, port, timeout=30)
+                if use_tls:
+                    conn.starttls()
+            with conn as s:
+                if user and password:
+                    s.login(user, password)
+                s.sendmail(msg["From"], [email_addr], msg.as_string())
+            print("[ALERT] Email sent to {}".format(email_addr))
+        except Exception as e:
+            print("[ALERT] Failed to send email: {}".format(e))
+    threading.Thread(target=_do, daemon=True).start()
+
+
 def _safe_filename(filename):
     """Strip path traversal components to keep files inside outdir."""
     parts = filename.replace("\\", "/").split("/")
@@ -839,6 +892,58 @@ def _save_file(received, total, filename, outdir):
             outpath, len(output_data), total
         ))
     return outpath
+
+
+def _rebuild_received_for_degradation(old_received, old_total, new_total, new_cap):
+    """Rebuild received dict when degradation changes chunk boundaries.
+
+    Maps old chunk data to new chunk indices based on byte offsets,
+    preserving all previously received data.
+    """
+    if not old_received or new_cap <= 0:
+        return {}
+
+    old_cap = None
+    for idx in sorted(old_received.keys()):
+        if idx < old_total - 1:
+            old_cap = len(old_received[idx])
+            break
+    if old_cap is None:
+        first_key = next(iter(old_received))
+        old_cap = len(old_received[first_key])
+    if old_cap <= 0:
+        return {}
+
+    file_size = max(k * old_cap + len(old_received[k]) for k in old_received)
+
+    new_received = {}
+    for j in range(new_total):
+        j_start = j * new_cap
+        if j_start >= file_size:
+            break
+        j_end = min(j_start + new_cap, file_size)
+        chunk_parts = []
+        fully_covered = True
+        pos = j_start
+
+        while pos < j_end:
+            old_idx = pos // old_cap
+            if old_idx not in old_received:
+                fully_covered = False
+                break
+            offset_in_old = pos - old_idx * old_cap
+            avail = len(old_received[old_idx]) - offset_in_old
+            if avail <= 0:
+                fully_covered = False
+                break
+            take = min(avail, j_end - pos)
+            chunk_parts.append(old_received[old_idx][offset_in_old:offset_in_old + take])
+            pos += take
+
+        if fully_covered and chunk_parts:
+            new_received[j] = b''.join(chunk_parts)
+
+    return new_received
 
 
 import re as _re
@@ -949,59 +1054,93 @@ def _decode_thread(frame_queue, result_queue, stop_event, multi_qr=False,
             continue
         frame_num, frame_bgr = item
 
-        if multi_qr:
-            texts = try_decode_qr_multi(frame_bgr)
-        else:
-            text = try_decode_qr(frame_bgr)
-            texts = [text] if text else None
-
-        if texts:
-            result_queue.put((frame_num, frame_bgr.shape[:2], texts))
-            continue
-
         try:
-            from visual_transport import decode_frame, is_calib_marker
-            raw = decode_frame(frame_bgr, grid_w, grid_h, n_levels, n_colors)
-            if raw is not None:
-                result_queue.put((frame_num, frame_bgr.shape[:2], [raw]))
-                continue
-        except Exception:
-            pass
+            if multi_qr:
+                texts = try_decode_qr_multi(frame_bgr)
+            else:
+                text = try_decode_qr(frame_bgr)
+                texts = [text] if text else None
 
-        result_queue.put((frame_num, frame_bgr.shape[:2], None))
+            if texts:
+                result_queue.put((frame_num, frame_bgr.shape[:2], texts))
+                continue
+
+            try:
+                from visual_transport import decode_frame, is_calib_marker
+                raw = decode_frame(frame_bgr, grid_w, grid_h, n_levels, n_colors)
+                if raw is not None:
+                    result_queue.put((frame_num, frame_bgr.shape[:2], [raw]))
+                    continue
+            except Exception:
+                pass
+
+            result_queue.put((frame_num, frame_bgr.shape[:2], None))
+        except Exception:
+            result_queue.put((frame_num, frame_bgr.shape[:2], None))
+
+
+def _load_config(path):
+    """Load YAML config file, return dict or empty dict if not found."""
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print("[config] Warning: failed to load {}: {}".format(path, e))
+        return {}
 
 
 def main():
     parser = argparse.ArgumentParser(description="QR Air Gap Receiver")
-    parser.add_argument("--outdir", "-o", default="received",
+    parser.add_argument("--config", default="config.yaml",
+                        help="Path to YAML config file (default: config.yaml)")
+    parser.add_argument("--outdir", "-o", default=None,
                         help="Output directory (default: received/)")
-    parser.add_argument("--fps", type=float, default=5,
+    parser.add_argument("--fps", type=float, default=None,
                         help="Capture frames per second (default: 5)")
-    parser.add_argument("--timeout", type=float, default=15,
+    parser.add_argument("--timeout", type=float, default=None,
                         help="Seconds of no new chunks before warning (default: 15)")
     parser.add_argument("--debug", action="store_true",
                         help="Save captured frames to debug_frames/")
     parser.add_argument("--region", type=str, default=None,
                         help="Skip GUI selector, use LEFT,TOP,WIDTH,HEIGHT")
-    parser.add_argument("--auto-next", action="store_true", default=True,
+    parser.add_argument("--auto-next", action="store_true", default=None,
                         help="Auto-send 'n' keystroke after file complete (default: on)")
     parser.add_argument("--no-auto-next", dest="auto_next", action="store_false",
                         help="Disable auto-sending 'n' keystroke")
-    parser.add_argument("--decode-workers", type=int, default=2,
+    parser.add_argument("--decode-workers", type=int, default=None,
                         help="Number of decode threads (default: 2)")
-    parser.add_argument("--verbose", "-v", action="store_true",
+    parser.add_argument("--verbose", "-v", action="store_true", default=None,
                         help="Show detailed processing steps")
-    parser.add_argument("--num-qr", type=int, default=1,
+    parser.add_argument("--num-qr", type=int, default=None,
                         help="[experimental] Number of QR codes per frame (default: 1)")
-    parser.add_argument("--grid", type=str, default="160,96",
+    parser.add_argument("--grid", type=str, default=None,
                         help="Expected data grid W,H for V3 grayN decoding (default: 160,96)")
-    parser.add_argument("--gray-levels", type=int, default=4, choices=[4, 8],
+    parser.add_argument("--gray-levels", type=int, default=None, choices=[4, 8],
                         help="Number of gray levels for V3 decoding (default: 4). "
                              "Auto-detected from calibration frame if sender sends one.")
-    parser.add_argument("--colors", type=int, default=1, choices=[1, 2, 4],
+    parser.add_argument("--colors", type=int, default=None, choices=[1, 2, 4],
                         help="Number of color channels for V3 decoding (default: 1). "
                              "Auto-detected from calibration frame if sender sends one.")
     args = parser.parse_args()
+
+    cfg = _load_config(args.config)
+    rcfg = cfg.get("receiver", {})
+    _DEFAULTS = {"outdir": "received", "fps": 5, "timeout": 15, "decode_workers": 2,
+                 "verbose": False, "grid": "160,96", "gray_levels": 4, "colors": 1,
+                 "auto_next": True, "num_qr": 1, "region": None}
+    for key, fallback in _DEFAULTS.items():
+        cli_val = getattr(args, key, None)
+        if cli_val is None:
+            cfg_val = rcfg.get(key)
+            setattr(args, key, cfg_val if cfg_val is not None else fallback)
+
+    args.alert_cfg = cfg.get("alert", {})
 
     global _receiver_verbose
     _receiver_verbose = args.verbose
@@ -1084,10 +1223,13 @@ def main():
     warned = False
     decode_fail_count = 0
     end_received = False
-    completed_sids = set()
+    completed_sessions = set()  # (sid, filename) pairs
     chunk_last_seen = {}  # idx -> timestamp of last decode
     _CYCLE_GAP = 10.0     # seconds: dup gap threshold for cycle detection
-    _calib_done = False   # True after first calibration frame detected
+    _last_calib_key = None  # (n_colors, n_levels) of last calibration that triggered Space
+    _session_switch_frame = -1  # frame_num at last session switch; ignore older results
+    _alert_sent = False
+    _alert_stall = float(args.alert_cfg.get("stall_seconds", 300))
 
     old_settings = termios.tcgetattr(sys.stdin)
     try:
@@ -1102,6 +1244,10 @@ def main():
             if ch == 'q':
                 print("\n\nStopped by user (q).")
                 break
+            if ch == 'c':
+                print("\n[RECALIB] Sending 'c' to sender for re-calibration")
+                _last_calib_key = None
+                _send_keystroke_async("c", delay=0.5)
 
             batch_count = 0
             while batch_count < 20:
@@ -1130,15 +1276,20 @@ def main():
                     continue
 
                 for raw_item in raw_texts:
-                    if isinstance(raw_item, bytes):
+                    if isinstance(raw_item, bytes) or _is_calib_result(raw_item):
                         from visual_transport import (is_v3_end_packet, decode_v3_packet,
-                                                      is_calib_marker)
+                                                      is_calib_marker, CalibResult)
                         if is_calib_marker(raw_item):
-                            if not _calib_done:
-                                _calib_done = True
+                            calib_nc = raw_item.n_colors if isinstance(raw_item, CalibResult) else _n_colors
+                            calib_nl = raw_item.n_levels if isinstance(raw_item, CalibResult) else _n_levels
+                            calib_key = (calib_nc, calib_nl)
+                            if calib_key != _last_calib_key:
+                                _last_calib_key = calib_key
+                                _n_colors = calib_nc
+                                _n_levels = calib_nl
                                 sys.stdout.write("\r\033[2K")
-                                calib_label = "gray{}".format(_n_levels) if _n_colors == 1 else \
-                                    "{}c×gray{}".format(_n_colors, _n_levels)
+                                calib_label = "gray{}".format(calib_nl) if calib_nc == 1 else \
+                                    "{}c×gray{}".format(calib_nc, calib_nl)
                                 print("[CALIB] {} calibration OK, sending Space to sender".format(
                                     calib_label))
                                 _send_keystroke_async(" ", delay=1.0)
@@ -1177,17 +1328,25 @@ def main():
 
                     sid = chunk_info["sid"]
                     idx = chunk_info["idx"]
+                    chunk_total = chunk_info["total"]
                     fname = chunk_info.get("filename", "")
 
-                    if sid in completed_sids:
+                    if (sid, fname) in completed_sessions:
+                        continue
+
+                    if not (0 <= idx < chunk_total):
+                        continue
+
+                    if sid != session_id and frame_num < _session_switch_frame:
                         continue
 
                     if session_id is None:
                         session_id = sid
-                        total = chunk_info["total"]
+                        total = chunk_total
                         current_filename = fname
                         chunk_last_seen.clear()
                         speed_tracker.reset()
+                        _session_switch_frame = frame_num
                         # slog.begin_session(sid, fname, total)
                         sys.stdout.write("\r\033[2K")
                         print("Session detected: {}  File: {}  Chunks: {}".format(
@@ -1198,18 +1357,44 @@ def main():
                         # slog.end_session("interrupted")
                         received = {}
                         session_id = sid
-                        total = chunk_info["total"]
+                        total = chunk_total
                         current_filename = fname
                         warned = False
                         decode_fail_count = 0
                         chunk_last_seen.clear()
-                        _calib_done = False
+                        _session_switch_frame = frame_num
                         speed_tracker.reset()
                         # slog.begin_session(sid, fname, total)
                         sys.stdout.write("\r\033[2K")
                         print("\nNew session detected: {}  File: {}  Chunks: {}".format(
                             sid, fname or "(unnamed)", total
                         ))
+
+                    if chunk_total != total:
+                        if sid == session_id and fname == current_filename and total is not None:
+                            from visual_transport import chunk_capacity_bytes
+                            ci_nl = chunk_info.get("n_levels", 4)
+                            ci_nc = chunk_info.get("n_colors", 1)
+                            new_cap = chunk_capacity_bytes(
+                                _grid_w, _grid_h, fname, ci_nl, ci_nc)
+                            if new_cap > 0:
+                                new_recv = _rebuild_received_for_degradation(
+                                    received, total, chunk_total, new_cap)
+                                old_count = len(received)
+                                received = new_recv
+                                total = chunk_total
+                                chunk_last_seen.clear()
+                                last_new_time = time.time()
+                                warned = False
+                                sys.stdout.write("\r\033[2K")
+                                print("[DEGRADE] Parameter change: total {} → {}, "
+                                      "rebuilt {}/{} chunks from previous data".format(
+                                          old_count, chunk_total,
+                                          len(received), chunk_total))
+                            else:
+                                continue
+                        else:
+                            continue
 
                     now = time.time()
                     prev_seen = chunk_last_seen.get(idx)
@@ -1251,7 +1436,7 @@ def main():
                         _save_file(received, total, current_filename, args.outdir)
                         _try_merge_parts(args.outdir, current_filename)
                         files_saved.append(current_filename or session_id)
-                        completed_sids.add(session_id)
+                        completed_sessions.add((session_id, current_filename))
                         # slog.end_session("complete")
 
                         received = {}
@@ -1261,7 +1446,6 @@ def main():
                         warned = False
                         decode_fail_count = 0
                         chunk_last_seen.clear()
-                        _calib_done = False
 
                         if args.auto_next:
                             print("Auto-sending 'n' to switch to next file...")
@@ -1294,6 +1478,13 @@ def main():
                         _send_missing_frames_async(missing)
                         last_new_time = now
 
+                if (stall_duration > _alert_stall
+                        and not _alert_sent
+                        and args.alert_cfg.get("email")):
+                    _alert_sent = True
+                    _send_alert_email(args.alert_cfg, current_filename,
+                                      len(received), total, stall_duration)
+
             time.sleep(0.02)
 
     except KeyboardInterrupt:
@@ -1306,11 +1497,15 @@ def main():
             t.join(timeout=2)
 
     if received and total:
-        _save_file(received, total, current_filename, args.outdir)
-        if len(received) >= total:
+        is_complete = len(received) >= total
+        save_name = current_filename
+        if not is_complete and current_filename:
+            save_name = current_filename + ".incomplete"
+        _save_file(received, total, save_name, args.outdir)
+        if is_complete:
             _try_merge_parts(args.outdir, current_filename)
         else:
-            print("[info] Part incomplete ({}/{} chunks) — skipping merge".format(
+            print("[info] Part incomplete ({}/{} chunks) — saved as .incomplete".format(
                 len(received), total))
         files_saved.append(current_filename or session_id or "unknown")
 

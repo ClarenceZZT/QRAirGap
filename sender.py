@@ -140,11 +140,22 @@ def _generate_single_v3_frame(args_tuple):
 
 def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
                               n_levels=4, n_colors=1, color_ch=1,
-                              start=0, end=None, on_progress=None, max_workers=None):
-    """Generate V3 frame images into an existing list."""
-    if end is None:
-        end = len(payloads)
-    n = end - start
+                              start=0, end=None, indices=None,
+                              on_progress=None, max_workers=None):
+    """Generate V3 frame images into an existing list.
+
+    If *indices* is provided, only those frame indices are generated
+    (start/end are ignored).
+    """
+    if indices is not None:
+        gen_indices = indices
+    else:
+        if end is None:
+            end = len(payloads)
+        gen_indices = list(range(start, end))
+    n = len(gen_indices)
+    if n == 0:
+        return
     cap = max_workers if max_workers is not None else 4
     workers = min(n, cap)
     t0 = _time.time()
@@ -159,7 +170,7 @@ def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
             on_progress(done[0], n)
 
     if workers <= 1:
-        for i in range(start, end):
+        for i in gen_indices:
             if _stop_event.is_set():
                 break
             result_idx, result_img = _generate_single_v3_frame(
@@ -167,7 +178,7 @@ def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
             _tick(result_idx, result_img)
     else:
         tasks = [(payloads[i], grid_w, grid_h, module_size, n_levels, n_colors, color_ch, i)
-                 for i in range(start, end)]
+                 for i in gen_indices]
         pool = ProcessPoolExecutor(max_workers=workers)
         futures = [pool.submit(_generate_single_v3_frame, t) for t in tasks]
         for future in as_completed(futures):
@@ -359,6 +370,20 @@ class SenderApp(object):
         self.color_ch = color_ch
         self.preload_ahead = preload_ahead
 
+        self._orig_n_colors = n_colors
+        self._orig_n_levels = n_levels
+        self._active_n_colors = n_colors
+        self._active_n_levels = n_levels
+        self._degrade_history = []
+        self._degrade_level = 0
+        self._degrade_sid = None
+        self._degrade_gen_indices = None
+        self._all_calib_done = False
+        self._calib_resume_after = False
+        self._calib_chain = []
+        self._calib_chain_idx = 0
+        self._calib_tk_imgs = {}
+
         self.file_entries = file_entries
         self.file_index = 0
         self.file_cache = {}   # index -> dict with pil_images
@@ -373,19 +398,13 @@ class SenderApp(object):
 
         self.root.title("QR Air Gap Sender")
         self.root.configure(bg="white")
-        try:
-            self.root.attributes("-alpha", 1.0)
-        except tk.TclError:
-            pass
-
-        self.canvas = tk.Canvas(root, bg="white", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
 
         self.status_var = tk.StringVar()
-        tk.Label(
+        self._status_label = tk.Label(
             root, textvariable=self.status_var,
             font=("Courier", 13), bg="white", fg="#333",
-        ).pack(side=tk.BOTTOM, pady=4)
+        )
+        self._status_label.pack(side=tk.BOTTOM, pady=4)
 
         self.file_var = tk.StringVar()
         tk.Label(
@@ -395,13 +414,22 @@ class SenderApp(object):
 
         help_text = "n/Right: next file  |  p/Left: prev file  |  Space: pause"
         if len(file_entries) == 1:
-            help_text = "Space: pause  |  r: reset  |  g: goto  |  +/-: speed  |  q: quit"
+            help_text = "Space: pause  |  r: reset  |  g: goto  |  c: recalib  |  +/-: speed  |  q: quit"
         else:
-            help_text += "\nr: reset  |  g: goto frame  |  +/-: speed  |  q: quit"
-        tk.Label(
+            help_text += "\nr: reset  |  g: goto  |  c: recalib  |  +/-: speed  |  q: quit"
+        self._help_label = tk.Label(
             root, text=help_text,
             font=("Courier", 10), bg="white", fg="#999", justify=tk.CENTER,
-        ).pack(side=tk.BOTTOM)
+        )
+        self._help_label.pack(side=tk.BOTTOM)
+
+        self._bottom_widgets = [self._help_label]
+
+        self._img_label = tk.Label(root, bg="white")
+        self._img_label.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(root, bg="white", highlightthickness=0)
+        self._canvas_visible = False
 
         self.root.bind("<space>", self._toggle_pause)
         self.root.bind("<plus>", self._speed_up)
@@ -413,13 +441,12 @@ class SenderApp(object):
         self.root.bind("<Left>", self._prev_file)
         self.root.bind("<g>", self._goto_frame)
         self.root.bind("<r>", self._reset_file)
+        self.root.bind("<c>", self._recalibrate)
         self.root.bind("<q>", self._quit)
         self.root.bind("<Escape>", self._quit)
         self.root.bind("<Configure>", self._on_resize)
         self.root.bind("<Key>", self._on_key)
 
-        self.countdown_text = None
-        self.img_on_canvas = None
         self._countdown_remaining = countdown
 
         self._missing_frames = None  # None = normal mode, list = missing-only mode
@@ -431,6 +458,87 @@ class SenderApp(object):
 
         self._prepare_current()
         self._start_countdown()
+
+    def _degradation_chain(self):
+        """Return list of (n_colors, n_levels) from original down to most robust."""
+        chain = [(self._orig_n_colors, self._orig_n_levels)]
+        nc, nl = self._orig_n_colors, self._orig_n_levels
+        if nc > 1:
+            chain.append((1, nl))
+        if nl > 4:
+            chain.append((1, 4))
+        return chain
+
+    def _try_degrade(self):
+        """Degrade encoding params for stuck frames. Returns True if degraded."""
+        chain = self._degradation_chain()
+        next_level = self._degrade_level + 1
+        if next_level >= len(chain):
+            self._degrade_history.clear()
+            print("[degrade] Already at lowest level ({}/{}), cannot degrade further".format(
+                self._degrade_level, len(chain) - 1))
+            self.status_var.set("[DEGRADE] already at minimum params")
+            return False
+        nc, nl = chain[next_level]
+        prev_nc, prev_nl = self._active_n_colors, self._active_n_levels
+        self._degrade_level = next_level
+        self._active_n_colors = nc
+        self._active_n_levels = nl
+        self._degrade_history.clear()
+        print("[degrade] Level {} -> {}: {}c×gray{} -> {}c×gray{}".format(
+            next_level - 1, next_level, prev_nc, prev_nl, nc, nl))
+
+        fi = self.file_index
+        old_meta = self.file_cache.get(fi)
+        old_sid = old_meta["sid"] if old_meta else None
+        old_missing = list(self._missing_frames) if self._missing_frames else []
+
+        # Compute which new chunks cover the old missing byte ranges
+        new_missing_indices = None
+        if old_meta and old_missing:
+            from visual_transport import chunk_capacity_bytes
+            fname = old_meta["filename"]
+            file_size = old_meta["size"]
+            old_cap = chunk_capacity_bytes(
+                self.grid_w, self.grid_h, fname, prev_nl, prev_nc)
+            new_cap = chunk_capacity_bytes(
+                self.grid_w, self.grid_h, fname, nl, nc)
+            if old_cap > 0 and new_cap > 0:
+                new_missing = set()
+                for idx in old_missing:
+                    byte_start = idx * old_cap
+                    byte_end = min(byte_start + old_cap, file_size)
+                    if byte_end <= byte_start:
+                        continue
+                    first_new = byte_start // new_cap
+                    last_new = (byte_end - 1) // new_cap
+                    for j in range(first_new, last_new + 1):
+                        new_missing.add(j)
+                new_missing_indices = sorted(new_missing)
+                print("[degrade] {} old missing chunks -> {} new chunks to send".format(
+                    len(old_missing), len(new_missing_indices)))
+
+        self.file_cache.pop(fi, None)
+        self._tk_cache.pop(fi, None)
+        self._calib_tk_img = None
+        self._missing_pos = 0
+        self.current_chunk = 0
+        self._cancel_pending()
+        self.paused = True
+
+        # Force same SID and set degrade-specific missing frames
+        self._degrade_sid = old_sid
+        if new_missing_indices:
+            self._missing_frames = new_missing_indices
+            self._degrade_gen_indices = new_missing_indices
+        else:
+            self._missing_frames = None
+            self._degrade_gen_indices = None
+
+        self._prepare_current()
+        self._countdown_remaining = 0
+        self._start_countdown()
+        return True
 
     def _current_info(self):
         return self.file_cache[self.file_index]
@@ -458,15 +566,25 @@ class SenderApp(object):
             self.file_var.set("File {}/{}: {} (loading...)".format(
                 fi + 1, len(self.file_entries), label))
 
+            _snap_sid = self._degrade_sid
+            self._degrade_sid = None
+            _snap_indices = list(self._degrade_gen_indices) if self._degrade_gen_indices else None
+            self._degrade_gen_indices = None
+            _snap_nl = self._active_n_levels
+            _snap_nc = self._active_n_colors
+
             def _bg_prepare():
+                sid_override = _snap_sid
+                degrade_indices = _snap_indices
                 meta = prepare_file_meta(
                     path, self.chunk_size, self.box_size, self.base_dir,
-                    protocol=self.protocol, session_id=self.session_id,
+                    protocol=self.protocol, session_id=sid_override or self.session_id,
                     grid_w=self.grid_w, grid_h=self.grid_h,
                     module_size=self.module_size,
                     offset=entry["offset"], length=entry["length"],
                     display_name=entry["display_name"],
-                    n_levels=self.n_levels, n_colors=self.n_colors,
+                    n_levels=_snap_nl,
+                    n_colors=_snap_nc,
                     color_ch=self.color_ch)
                 is_v3 = self.protocol == 3 and meta.get("grid_w") is not None
                 nl = meta.get("n_levels", 4)
@@ -480,31 +598,51 @@ class SenderApp(object):
                         nl, nc, cc)
                     meta["_calib_pil"] = calib_img
 
-                    _, first_img = _generate_single_v3_frame((
-                        meta["payloads"][0], meta["grid_w"], meta["grid_h"],
-                        meta["module_size"], nl, nc, cc, 0))
-                else:
-                    _, first_img = _generate_single_qr((
-                        meta["payloads"][0], meta["version"],
-                        self.box_size, 6, 0))
-                meta["pil_images"][0] = first_img
-                with self._preload_lock:
-                    self.file_cache[fi] = meta
-                total_frames = meta["total"]
-                self.root.after(0, lambda: self._on_file_ready(fi, meta))
-                if total_frames > 1:
-                    _log("[app] First frame ready, generating rest in background...")
+                if degrade_indices is not None and is_v3:
+                    with self._preload_lock:
+                        self.file_cache[fi] = meta
+                    total_frames = meta["total"]
+                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                    _log("[app] Degradation: generating only {} of {} frames".format(
+                        len(degrade_indices), total_frames))
                     def _on_progress(batch_done, batch_total):
-                        overall = batch_done + 1
                         if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
-                            self.root.after(0, lambda d=overall: self._update_gen_progress(fi, d, total_frames))
+                            self.root.after(0, lambda d=batch_done: self._update_gen_progress(fi, d, len(degrade_indices)))
+                    _generate_v3_images_into(
+                        meta["pil_images"], meta["payloads"],
+                        meta["grid_w"], meta["grid_h"], meta["module_size"],
+                        n_levels=nl, n_colors=nc, color_ch=cc,
+                        indices=degrade_indices, on_progress=_on_progress,
+                        max_workers=self.qr_workers)
+                    _log("[app] Degradation: {} frames ready".format(len(degrade_indices)))
+                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                else:
                     if is_v3:
-                        _generate_v3_images_into(
-                            meta["pil_images"], meta["payloads"],
-                            meta["grid_w"], meta["grid_h"], meta["module_size"],
-                            n_levels=nl, n_colors=nc, color_ch=cc,
-                            start=1, on_progress=_on_progress,
-                            max_workers=self.qr_workers)
+                        _, first_img = _generate_single_v3_frame((
+                            meta["payloads"][0], meta["grid_w"], meta["grid_h"],
+                            meta["module_size"], nl, nc, cc, 0))
+                    else:
+                        _, first_img = _generate_single_qr((
+                            meta["payloads"][0], meta["version"],
+                            self.box_size, 6, 0))
+                    meta["pil_images"][0] = first_img
+                    with self._preload_lock:
+                        self.file_cache[fi] = meta
+                    total_frames = meta["total"]
+                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                    if total_frames > 1:
+                        _log("[app] First frame ready, generating rest in background...")
+                        def _on_progress(batch_done, batch_total):
+                            overall = batch_done + 1
+                            if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
+                                self.root.after(0, lambda d=overall: self._update_gen_progress(fi, d, total_frames))
+                        if is_v3:
+                            _generate_v3_images_into(
+                                meta["pil_images"], meta["payloads"],
+                                meta["grid_w"], meta["grid_h"], meta["module_size"],
+                                n_levels=nl, n_colors=nc, color_ch=cc,
+                                start=1, on_progress=_on_progress,
+                                max_workers=self.qr_workers)
                     else:
                         _generate_qr_images_into(
                             meta["pil_images"], meta["payloads"],
@@ -556,6 +694,8 @@ class SenderApp(object):
             return
 
         limit = self.preload_ahead
+        if limit == 0:
+            return
         if limit > 0:
             end_idx = min(start_idx + limit, len(self.file_entries))
         else:
@@ -595,10 +735,11 @@ class SenderApp(object):
     def _evict_file_caches(self):
         """Release file caches outside the preload window to free memory."""
         limit = self.preload_ahead
-        if limit <= 0:
-            return
         keep_lo = self.file_index
-        keep_hi = self.file_index + limit
+        if limit < 0:
+            keep_hi = len(self.file_entries)
+        else:
+            keep_hi = self.file_index + max(limit, 1)
         for k in list(self.file_cache.keys()):
             if k < keep_lo or k > keep_hi:
                 del self.file_cache[k]
@@ -606,9 +747,14 @@ class SenderApp(object):
                 _log("[evict] Released cache for file {}".format(k + 1))
 
     def _mode_label(self):
-        if self.n_colors == 1:
-            return "V3/gray{}".format(self.n_levels)
-        return "V3/{}c×gray{}".format(self.n_colors, self.n_levels)
+        nc = self._active_n_colors
+        nl = self._active_n_levels
+        suffix = ""
+        if self._degrade_level > 0:
+            suffix = " [degraded L{}]".format(self._degrade_level)
+        if nc == 1:
+            return "V3/gray{}{}".format(nl, suffix)
+        return "V3/{}c×gray{}{}".format(nc, nl, suffix)
 
     def _cancel_pending(self):
         if self._after_id is not None:
@@ -616,69 +762,93 @@ class SenderApp(object):
             self._after_id = None
 
     def _start_countdown(self):
-        if self.countdown_text is not None:
-            self.canvas.delete(self.countdown_text)
-        cx = self.canvas.winfo_width() // 2 or 300
-        cy = self.canvas.winfo_height() // 2 or 300
         if self._countdown_remaining > 0:
-            self.countdown_text = self.canvas.create_text(
-                cx, cy, text=str(self._countdown_remaining),
-                font=("Helvetica", 120, "bold"), fill="#333",
-            )
             self.status_var.set("Starting in {}...".format(self._countdown_remaining))
             self._countdown_remaining -= 1
             self._after_id = self.root.after(1000, self._start_countdown)
         else:
-            self.countdown_text = None
             self.current_chunk = 0
             self.paused = False
-            if self.protocol == 3:
-                self._show_calibration()
+            if self.protocol == 3 and not self._all_calib_done:
+                self._start_calib_sequence()
+            elif self.protocol == 3:
+                self._show_frame()
             else:
                 self._show_frame()
 
-    def _show_calibration(self):
-        """Display a single calibration frame, then wait for Space to start."""
-        if self.file_index not in self.file_cache:
-            self._after_id = self.root.after(100, self._show_calibration)
-            return
-
-        info = self._current_info()
-        calib_pil = info.get("_calib_pil")
-        if calib_pil is None:
-            self._show_frame()
-            return
-
-        if self._calib_tk_img is None:
-            self._calib_tk_img = ImageTk.PhotoImage(calib_pil)
-
-        cx = self.canvas.winfo_width() // 2
-        cy = self.canvas.winfo_height() // 2
-        if self.img_on_canvas is not None:
-            self.canvas.itemconfig(self.img_on_canvas, image=self._calib_tk_img)
-            self.canvas.coords(self.img_on_canvas, cx, cy)
-        else:
-            self.img_on_canvas = self.canvas.create_image(
-                cx, cy, image=self._calib_tk_img)
-
-        nl = info.get("n_levels", 4)
+    def _start_calib_sequence(self):
+        """Start calibration for all protocols in the degradation chain."""
+        chain = self._degradation_chain()
+        self._calib_chain = chain
+        self._calib_chain_idx = 0
+        self._calib_tk_imgs = {}
+        from visual_transport import calibration_frame_to_pil
+        for nc, nl in chain:
+            img = calibration_frame_to_pil(
+                self.grid_w, self.grid_h, self.module_size,
+                nl, nc, self.color_ch)
+            self._calib_tk_imgs[(nc, nl)] = ImageTk.PhotoImage(img)
         self.paused = True
+        self._show_calib_step()
+
+    def _show_calib_step(self):
+        """Show the current calibration frame in the sequence."""
+        if self._calib_chain_idx >= len(self._calib_chain):
+            self._finish_calib_sequence()
+            return
+        nc, nl = self._calib_chain[self._calib_chain_idx]
+        tk_img = self._calib_tk_imgs.get((nc, nl))
+        if tk_img is None:
+            self._finish_calib_sequence()
+            return
+        self._calib_tk_img = tk_img
+        self._img_label.configure(image=tk_img)
+        if nc == 1:
+            label = "V3/gray{}".format(nl)
+        else:
+            label = "V3/{}c×gray{}".format(nc, nl)
         self._calib_auto_countdown = 15
-        self._calib_auto_tick()
+        self.status_var.set("[CALIB {}/{}] {} — Space to advance / auto in {}s".format(
+            self._calib_chain_idx + 1, len(self._calib_chain),
+            label, self._calib_auto_countdown))
+        self._calib_auto_countdown -= 1
+        self._after_id = self.root.after(1000, self._calib_auto_tick)
 
     def _calib_auto_tick(self):
-        """Countdown during calibration; auto-start when it reaches 0."""
+        """Countdown during calibration; auto-advance when it reaches 0."""
         if self._calib_tk_img is None:
             return
         if self._calib_auto_countdown <= 0:
-            self._calib_tk_img = None
-            self.paused = False
-            self._show_frame()
+            self._advance_calib()
             return
-        self.status_var.set("[CALIB] {} — Space to start / auto in {}s".format(
-            self._mode_label(), self._calib_auto_countdown))
+        nc, nl = self._calib_chain[self._calib_chain_idx]
+        if nc == 1:
+            label = "V3/gray{}".format(nl)
+        else:
+            label = "V3/{}c×gray{}".format(nc, nl)
+        self.status_var.set("[CALIB {}/{}] {} — Space to advance / auto in {}s".format(
+            self._calib_chain_idx + 1, len(self._calib_chain),
+            label, self._calib_auto_countdown))
         self._calib_auto_countdown -= 1
         self._after_id = self.root.after(1000, self._calib_auto_tick)
+
+    def _advance_calib(self):
+        """Move to the next protocol in the calibration sequence."""
+        self._cancel_pending()
+        self._calib_chain_idx += 1
+        self._show_calib_step()
+
+    def _finish_calib_sequence(self):
+        """All protocols calibrated; start normal transmission."""
+        self._calib_tk_img = None
+        self._calib_tk_imgs = {}
+        self._all_calib_done = True
+        self.paused = False
+        if self._calib_resume_after:
+            self._calib_resume_after = False
+            self._show_frame()
+        else:
+            self._show_frame()
 
     def _show_frame(self):
         if self.paused:
@@ -693,6 +863,11 @@ class SenderApp(object):
         info = self._current_info()
 
         if self.num_qr > 1:
+            if not self._canvas_visible:
+                self._img_label.pack_forget()
+                self.canvas.pack(fill=tk.BOTH, expand=True,
+                                 before=self._bottom_widgets[0])
+                self._canvas_visible = True
             if not self._show_multi_qr(info):
                 return
         else:
@@ -720,13 +895,7 @@ class SenderApp(object):
                 self.current_chunk = (self.current_chunk + 1) % info["total"]
                 label = "chunk {}/{}".format(frame_idx + 1, info["total"])
 
-            cx = self.canvas.winfo_width() // 2
-            cy = self.canvas.winfo_height() // 2
-            if self.img_on_canvas is not None:
-                self.canvas.itemconfig(self.img_on_canvas, image=tk_img)
-                self.canvas.coords(self.img_on_canvas, cx, cy)
-            else:
-                self.img_on_canvas = self.canvas.create_image(cx, cy, image=tk_img)
+            self._img_label.configure(image=tk_img)
 
             self.status_var.set("[{}]  {}   {:.1f} fps".format(
                 info["sid"], label, self.fps
@@ -774,6 +943,7 @@ class SenderApp(object):
             else:
                 item = self.canvas.create_image(cx, cy, image=tk_img)
                 self._multi_img_items.append(item)
+            self.canvas.tag_raise(self._multi_img_items[q])
 
         if self._missing_frames is not None:
             self._missing_pos = (self._missing_pos + self.num_qr) % len(self._missing_frames)
@@ -802,15 +972,26 @@ class SenderApp(object):
         self._calib_tk_img = None
         self._input_mode = False
         self._input_buffer = ""
+        if self._degrade_level > 0:
+            _log("[degrade] Reset to original params on file switch")
+        self._degrade_level = 0
+        self._degrade_history.clear()
+        self._degrade_sid = None
+        self._degrade_gen_indices = None
+        self._active_n_colors = self._orig_n_colors
+        self._active_n_levels = self._orig_n_levels
         if self._input_timeout_id is not None:
             self.root.after_cancel(self._input_timeout_id)
             self._input_timeout_id = None
-        if self.img_on_canvas is not None:
-            self.canvas.delete(self.img_on_canvas)
-            self.img_on_canvas = None
         for item in self._multi_img_items:
             self.canvas.delete(item)
         self._multi_img_items.clear()
+        if self._canvas_visible:
+            self.canvas.pack_forget()
+            self._img_label.pack(fill=tk.BOTH, expand=True,
+                                 before=self._bottom_widgets[0])
+            self._canvas_visible = False
+        self._evict_file_caches()
         self._prepare_current()
         self._countdown_remaining = self.countdown_duration
         self._start_countdown()
@@ -835,21 +1016,21 @@ class SenderApp(object):
         """Display END QR/frame and auto-quit after a few seconds."""
         self._cancel_pending()
         self.paused = True
-        if self.img_on_canvas is not None:
-            self.canvas.delete(self.img_on_canvas)
-            self.img_on_canvas = None
         for item in self._multi_img_items:
             self.canvas.delete(item)
         self._multi_img_items.clear()
+        if self._canvas_visible:
+            self.canvas.pack_forget()
+            self._img_label.pack(fill=tk.BOTH, expand=True,
+                                 before=self._bottom_widgets[0])
+            self._canvas_visible = False
 
         if self.protocol == 3:
             from visual_transport import encode_v3_end_packet, encode_frame, frame_to_pil
-            # Always encode END frame as gray-only (n_colors=1) to survive
-            # JPEG chroma subsampling — the few colored symbols in a
-            # normal END frame get destroyed by remote-desktop compression.
-            end_pkt = encode_v3_end_packet(self.n_levels, n_colors=1)
+            end_nl = self._active_n_levels
+            end_pkt = encode_v3_end_packet(end_nl, n_colors=1)
             frame_rgb = encode_frame(end_pkt, self.grid_w, self.grid_h,
-                                     self.module_size, self.n_levels,
+                                     self.module_size, end_nl,
                                      n_colors=1)
             img = frame_to_pil(frame_rgb)
         else:
@@ -862,10 +1043,7 @@ class SenderApp(object):
             qr.make(fit=True)
             img = qr.make_image(fill_color="black", back_color="white").get_image()
         self._end_tk_img = ImageTk.PhotoImage(img)
-
-        cx = self.canvas.winfo_width() // 2
-        cy = self.canvas.winfo_height() // 2
-        self.img_on_canvas = self.canvas.create_image(cx, cy, image=self._end_tk_img)
+        self._img_label.configure(image=self._end_tk_img)
 
         self.file_var.set("All {} files sent!".format(len(self.file_entries)))
         self._end_countdown = 5
@@ -882,13 +1060,11 @@ class SenderApp(object):
     def _toggle_pause(self, event=None):
         if self._input_mode:
             return
-        was_calib = self._calib_tk_img is not None
-        self.paused = not self.paused
-        if not self.paused and was_calib:
+        if self._calib_tk_img is not None:
             self._cancel_pending()
-            self._calib_tk_img = None
-            self._show_frame()
+            self._advance_calib()
             return
+        self.paused = not self.paused
         if self.paused:
             if self.file_index not in self.file_cache:
                 self.status_var.set("PAUSED (loading...)")
@@ -994,6 +1170,18 @@ class SenderApp(object):
             if self._missing_frames is None:
                 print("[missing] No valid frames")
             return
+
+        if self.protocol == 3:
+            key = tuple(sorted(set(frames)))
+            self._degrade_history.append(key)
+            if len(self._degrade_history) > 3:
+                self._degrade_history = self._degrade_history[-3:]
+            if (len(self._degrade_history) == 3
+                    and self._degrade_history[0] == self._degrade_history[1]
+                    and self._degrade_history[1] == self._degrade_history[2]):
+                if self._try_degrade():
+                    return
+
         if not self._input_replace and self._missing_frames is not None:
             existing = set(self._missing_frames)
             new_frames = [f for f in frames if f not in existing]
@@ -1026,6 +1214,20 @@ class SenderApp(object):
             print("[reset] File {}: {} -- restarting from frame 0".format(
                 self.file_index + 1, info["filename"]))
         self._show_frame()
+
+    def _recalibrate(self, event=None):
+        """Re-calibrate all protocols, then resume from current position."""
+        if self._input_mode:
+            return
+        if self.protocol != 3:
+            return
+        if self._calib_tk_img is not None:
+            return
+        self._cancel_pending()
+        self.paused = True
+        self._calib_resume_after = True
+        print("[recalib] Starting re-calibration of all protocols")
+        self._start_calib_sequence()
 
     def _goto_frame(self, event=None):
         if self._input_mode:
@@ -1060,7 +1262,7 @@ class SenderApp(object):
         os._exit(0)
 
     def _on_resize(self, event=None):
-        if self.num_qr > 1 and self._multi_img_items:
+        if self.num_qr > 1 and self._multi_img_items and self._canvas_visible:
             ncols = math.ceil(math.sqrt(self.num_qr))
             nrows = math.ceil(self.num_qr / ncols)
             cw = self.canvas.winfo_width()
@@ -1073,10 +1275,6 @@ class SenderApp(object):
                 cx = int((col + 0.5) * cell_w)
                 cy = int((row + 0.5) * cell_h)
                 self.canvas.coords(item, cx, cy)
-        elif self.img_on_canvas is not None:
-            cx = self.canvas.winfo_width() // 2
-            cy = self.canvas.winfo_height() // 2
-            self.canvas.coords(self.img_on_canvas, cx, cy)
 
 
 def main():
@@ -1116,8 +1314,8 @@ def main():
     parser.add_argument("--split-size", type=str, default="1G",
                         help="Split files larger than this into segments (default: 1G). "
                              "Supports K/M/G suffixes.")
-    parser.add_argument("--preload-ahead", type=int, default=0,
-                        help="Number of files to preload ahead (default: 0 = all). "
+    parser.add_argument("--preload-ahead", type=int, default=-1,
+                        help="Number of files to preload ahead (default: -1 = all, 0 = none). "
                              "Use a small value (e.g. 1-2) for very large file sets to limit memory.")
     args = parser.parse_args()
 
@@ -1240,11 +1438,6 @@ def main():
 
     root = tk.Tk()
     root.configure(bg="white")
-    try:
-        root.attributes("-alpha", 1.0)
-        root.wm_attributes("-topmost", False)
-    except tk.TclError:
-        pass
     num_qr = max(1, args.num_qr)
     if args.protocol == 3 and num_qr > 1:
         print("[WARN] --num-qr > 1 is not supported with --protocol 3, forcing num-qr=1")

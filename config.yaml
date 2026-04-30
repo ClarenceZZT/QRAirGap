@@ -1,0 +1,24 @@
+# QR Air Gap Receiver Configuration
+# CLI arguments override values set here.
+
+receiver:
+  outdir: "received/Socle"
+  fps: 20
+  timeout: 60
+  decode_workers: 16
+  verbose: true
+  grid: "440,220"
+  gray_levels: 8       # 4 or 8
+  colors: 4        # 1, 2, or 4
+  auto_next: true
+  # region: "100,200,600,650"   # uncomment to skip GUI selector
+  # num_qr: 1
+
+alert:
+  email: "zt.zhang@shinechip.net"                      # leave empty to disable
+  smtp_server: "smtp.qiye.aliyun.com"
+  smtp_port: 465
+  smtp_user: "zt.zhang@shinechip.net"
+  smtp_password: "AR7GaEe9GCLoHW5n"
+  smtp_use_tls: false
+  stall_seconds: 300             # send alert after this many seconds without new frames
