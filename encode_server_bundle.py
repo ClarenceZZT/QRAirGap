@@ -43,8 +43,8 @@ OUTPUT = os.path.join(_HERE, "server_bundle.b64")
 
 ROOT_FILES = (
     ("sender.py", "sender.py"),
-    ("protocol.py", "protocol.py"),
-    ("visual_transport.py", "visual_transport.py"),
+    # ("protocol.py", "protocol.py"),
+    # ("visual_transport.py", "visual_transport.py"),
 )
 
 VENDOR_DIR = os.path.join(_HERE, "qrcode_vendor")

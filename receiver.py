@@ -855,6 +855,49 @@ def _send_alert_email(alert_cfg, filename, progress, total, stall_secs):
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _send_completion_email(alert_cfg, filename, size_bytes, elapsed_secs):
+    """Send a file-complete notification email in a background thread."""
+    email_addr = alert_cfg.get("email", "")
+    if not email_addr:
+        return
+    def _do():
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            subject = "[QRAirGap] Complete: {}".format(filename or "unknown")
+            body = (
+                "File transfer completed.\n\n"
+                "File: {}\n"
+                "Size: {:.2f} MB\n"
+                "Time: {:.0f}s\n"
+            ).format(filename or "(unnamed)", size_bytes / 1048576, elapsed_secs)
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = alert_cfg.get("smtp_user", email_addr)
+            msg["To"] = email_addr
+
+            server = alert_cfg.get("smtp_server", "")
+            port = int(alert_cfg.get("smtp_port", 587))
+            user = alert_cfg.get("smtp_user", "")
+            password = alert_cfg.get("smtp_password", "")
+            use_tls = alert_cfg.get("smtp_use_tls", True)
+
+            if port == 465 and not use_tls:
+                conn = smtplib.SMTP_SSL(server, port, timeout=30)
+            else:
+                conn = smtplib.SMTP(server, port, timeout=30)
+                if use_tls:
+                    conn.starttls()
+            with conn as s:
+                if user and password:
+                    s.login(user, password)
+                s.sendmail(msg["From"], [email_addr], msg.as_string())
+            print("[NOTIFY] Completion email sent to {}".format(email_addr))
+        except Exception as e:
+            print("[NOTIFY] Failed to send email: {}".format(e))
+    threading.Thread(target=_do, daemon=True).start()
+
+
 def _safe_filename(filename):
     """Strip path traversal components to keep files inside outdir."""
     parts = filename.replace("\\", "/").split("/")
@@ -872,24 +915,20 @@ def _save_file(received, total, filename, outdir):
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
     missing = set(range(total)) - set(received.keys())
-    parts = []
-    for i in range(total):
-        if i in received:
-            parts.append(received[i])
-        else:
-            parts.append(b"[MISSING CHUNK %d]" % i)
-    output_data = b"".join(parts)
-
+    written = 0
     with open(outpath, "wb") as f:
-        f.write(output_data)
+        for i in range(total):
+            chunk = received.get(i, b"[MISSING CHUNK %d]" % i)
+            f.write(chunk)
+            written += len(chunk)
 
     if missing:
         print("\nSaved (incomplete): {} ({} B, {} missing chunks)".format(
-            outpath, len(output_data), len(missing)
+            outpath, written, len(missing)
         ))
     else:
         print("\nSaved: {} ({} B, all {} chunks OK)".format(
-            outpath, len(output_data), total
+            outpath, written, total
         ))
     return outpath
 
@@ -1186,7 +1225,7 @@ def main():
 
     interval = 1.0 / args.fps
     frame_queue = queue.Queue(maxsize=8)
-    result_queue = queue.Queue()
+    result_queue = queue.Queue(maxsize=200)
     stop_event = threading.Event()
 
     cap_thread = threading.Thread(
@@ -1228,8 +1267,10 @@ def main():
     _CYCLE_GAP = 10.0     # seconds: dup gap threshold for cycle detection
     _last_calib_key = None  # (n_colors, n_levels) of last calibration that triggered Space
     _session_switch_frame = -1  # frame_num at last session switch; ignore older results
+    _session_start_time = time.time()
     _alert_sent = False
     _alert_stall = float(args.alert_cfg.get("stall_seconds", 300))
+    _last_real_progress_time = time.time()
 
     old_settings = termios.tcgetattr(sys.stdin)
     try:
@@ -1347,6 +1388,7 @@ def main():
                         chunk_last_seen.clear()
                         speed_tracker.reset()
                         _session_switch_frame = frame_num
+                        _session_start_time = time.time()
                         # slog.begin_session(sid, fname, total)
                         sys.stdout.write("\r\033[2K")
                         print("Session detected: {}  File: {}  Chunks: {}".format(
@@ -1363,6 +1405,7 @@ def main():
                         decode_fail_count = 0
                         chunk_last_seen.clear()
                         _session_switch_frame = frame_num
+                        _session_start_time = time.time()
                         speed_tracker.reset()
                         # slog.begin_session(sid, fname, total)
                         sys.stdout.write("\r\033[2K")
@@ -1385,6 +1428,7 @@ def main():
                                 total = chunk_total
                                 chunk_last_seen.clear()
                                 last_new_time = time.time()
+                                _last_real_progress_time = time.time()
                                 warned = False
                                 sys.stdout.write("\r\033[2K")
                                 print("[DEGRADE] Parameter change: total {} → {}, "
@@ -1407,6 +1451,7 @@ def main():
                         _pipeline_stats.tick("decode_ok")
                         # slog.chunk_ok(idx, len(chunk_info["data"]), frame_num)
                         last_new_time = now
+                        _last_real_progress_time = now
                         warned = False
                         if total is not None:
                             print_progress(session_id, len(received), total, args.fps,
@@ -1438,6 +1483,12 @@ def main():
                         files_saved.append(current_filename or session_id)
                         completed_sessions.add((session_id, current_filename))
                         # slog.end_session("complete")
+
+                        file_size = sum(len(v) for v in received.values())
+                        elapsed = time.time() - _session_start_time
+                        _send_completion_email(args.alert_cfg,
+                                               current_filename, file_size, elapsed)
+                        _alert_sent = False
 
                         received = {}
                         session_id = None
@@ -1478,12 +1529,13 @@ def main():
                         _send_missing_frames_async(missing)
                         last_new_time = now
 
-                if (stall_duration > _alert_stall
+                real_stall = now - _last_real_progress_time
+                if (real_stall > _alert_stall
                         and not _alert_sent
                         and args.alert_cfg.get("email")):
                     _alert_sent = True
                     _send_alert_email(args.alert_cfg, current_filename,
-                                      len(received), total, stall_duration)
+                                      len(received), total, real_stall)
 
             time.sleep(0.02)
 

@@ -45,6 +45,7 @@ from protocol import (
 
 _verbose = False
 _stop_event = threading.Event()
+_pool_semaphore = threading.Semaphore(1)
 
 
 def _log(msg):
@@ -81,7 +82,8 @@ def _generate_single_qr(args_tuple):
 
 
 def _generate_qr_images_into(images, payloads, version, box_size, border,
-                              start=0, end=None, on_progress=None, max_workers=None):
+                              start=0, end=None, on_progress=None, max_workers=None,
+                              cancel_event=None):
     """Generate QR images into an existing list. Uses multiprocessing for true parallelism."""
     if end is None:
         end = len(payloads)
@@ -90,6 +92,7 @@ def _generate_qr_images_into(images, payloads, version, box_size, border,
     workers = min(n, cap)
     t0 = _time.time()
     done = [0]
+    _cancel = cancel_event or threading.Event()
 
     def _tick(idx, img):
         images[idx] = img
@@ -101,27 +104,36 @@ def _generate_qr_images_into(images, payloads, version, box_size, border,
 
     if workers <= 1:
         for i in range(start, end):
-            if _stop_event.is_set():
+            if _stop_event.is_set() or _cancel.is_set():
                 break
             result_idx, result_img = _generate_single_qr((payloads[i], version, box_size, border, i))
             _tick(result_idx, result_img)
     else:
         tasks = [(payloads[i], version, box_size, border, i) for i in range(start, end)]
-        pool = ProcessPoolExecutor(max_workers=workers)
-        futures = [pool.submit(_generate_single_qr, t) for t in tasks]
-        for future in as_completed(futures):
-            if _stop_event.is_set():
-                break
-            try:
-                idx, img = future.result()
-            except Exception as e:
-                _log("[qr] Frame generation failed: {}".format(e))
-                continue
-            if img is not None:
-                _tick(idx, img)
-        for f in futures:
-            f.cancel()
-        pool.shutdown(wait=True)
+        _pool_semaphore.acquire()
+        try:
+            if _cancel.is_set():
+                return
+            pool = ProcessPoolExecutor(max_workers=workers)
+            futures = [pool.submit(_generate_single_qr, t) for t in tasks]
+            for future in as_completed(futures):
+                if _stop_event.is_set() or _cancel.is_set():
+                    break
+                try:
+                    idx, img = future.result()
+                except Exception as e:
+                    _log("[qr] Frame generation failed: {}".format(e))
+                    continue
+                if img is not None:
+                    _tick(idx, img)
+            for f in futures:
+                f.cancel()
+            pool.shutdown(wait=True)
+        finally:
+            _pool_semaphore.release()
+    if _cancel.is_set():
+        _log("[qr] Generation cancelled")
+        return
     if _verbose:
         sys.stdout.write("\n")
     elapsed = _time.time() - t0
@@ -141,7 +153,8 @@ def _generate_single_v3_frame(args_tuple):
 def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
                               n_levels=4, n_colors=1, color_ch=1,
                               start=0, end=None, indices=None,
-                              on_progress=None, max_workers=None):
+                              on_progress=None, max_workers=None,
+                              cancel_event=None):
     """Generate V3 frame images into an existing list.
 
     If *indices* is provided, only those frame indices are generated
@@ -160,6 +173,7 @@ def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
     workers = min(n, cap)
     t0 = _time.time()
     done = [0]
+    _cancel = cancel_event or threading.Event()
 
     def _tick(idx, img):
         images[idx] = img
@@ -171,7 +185,7 @@ def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
 
     if workers <= 1:
         for i in gen_indices:
-            if _stop_event.is_set():
+            if _stop_event.is_set() or _cancel.is_set():
                 break
             result_idx, result_img = _generate_single_v3_frame(
                 (payloads[i], grid_w, grid_h, module_size, n_levels, n_colors, color_ch, i))
@@ -179,21 +193,30 @@ def _generate_v3_images_into(images, payloads, grid_w, grid_h, module_size,
     else:
         tasks = [(payloads[i], grid_w, grid_h, module_size, n_levels, n_colors, color_ch, i)
                  for i in gen_indices]
-        pool = ProcessPoolExecutor(max_workers=workers)
-        futures = [pool.submit(_generate_single_v3_frame, t) for t in tasks]
-        for future in as_completed(futures):
-            if _stop_event.is_set():
-                break
-            try:
-                idx, img = future.result()
-            except Exception as e:
-                _log("[v3] Frame generation failed: {}".format(e))
-                continue
-            if img is not None:
-                _tick(idx, img)
-        for f in futures:
-            f.cancel()
-        pool.shutdown(wait=True)
+        _pool_semaphore.acquire()
+        try:
+            if _cancel.is_set():
+                return
+            pool = ProcessPoolExecutor(max_workers=workers)
+            futures = [pool.submit(_generate_single_v3_frame, t) for t in tasks]
+            for future in as_completed(futures):
+                if _stop_event.is_set() or _cancel.is_set():
+                    break
+                try:
+                    idx, img = future.result()
+                except Exception as e:
+                    _log("[v3] Frame generation failed: {}".format(e))
+                    continue
+                if img is not None:
+                    _tick(idx, img)
+            for f in futures:
+                f.cancel()
+            pool.shutdown(wait=True)
+        finally:
+            _pool_semaphore.release()
+    if _cancel.is_set():
+        _log("[v3] Generation cancelled")
+        return
     if _verbose:
         sys.stdout.write("\n")
     elapsed = _time.time() - t0
@@ -320,13 +343,15 @@ def prepare_file_meta(filepath, chunk_size, box_size, base_dir=None, protocol=1,
 def prepare_file_data(filepath, chunk_size, box_size, base_dir=None, protocol=1,
                       session_id=None, grid_w=160, grid_h=96, module_size=4,
                       offset=0, length=None, display_name=None,
-                      n_levels=4, n_colors=1, color_ch=1):
+                      n_levels=4, n_colors=1, color_ch=1, cancel_event=None):
     """Generate all QR/V3 PIL images (blocking). Used by preload thread."""
     meta = prepare_file_meta(filepath, chunk_size, box_size, base_dir,
                              protocol=protocol, session_id=session_id,
                              grid_w=grid_w, grid_h=grid_h, module_size=module_size,
                              offset=offset, length=length, display_name=display_name,
                              n_levels=n_levels, n_colors=n_colors, color_ch=color_ch)
+    if cancel_event and cancel_event.is_set():
+        return None
     if protocol == 3 and meta.get("grid_w") is not None:
         nl = meta.get("n_levels", 4)
         nc = meta.get("n_colors", 1)
@@ -337,11 +362,14 @@ def prepare_file_data(filepath, chunk_size, box_size, base_dir=None, protocol=1,
         _generate_v3_images_into(
             meta["pil_images"], meta["payloads"],
             meta["grid_w"], meta["grid_h"], meta["module_size"],
-            n_levels=nl, n_colors=nc, color_ch=cc)
+            n_levels=nl, n_colors=nc, color_ch=cc, cancel_event=cancel_event)
     else:
         _generate_qr_images_into(
             meta["pil_images"], meta["payloads"],
-            meta["version"], box_size, 6)
+            meta["version"], box_size, 6, cancel_event=cancel_event)
+    if cancel_event and cancel_event.is_set():
+        return None
+    meta["payloads"] = None
     _log("[prepare] Done: {} PIL images ready".format(meta["total"]))
     return meta
 
@@ -390,6 +418,7 @@ class SenderApp(object):
         self._tk_cache = {}    # index -> list of ImageTk.PhotoImage
         self._preload_lock = threading.Lock()
         self._preload_thread = None
+        self._cancel_gen = threading.Event()
 
         self.current_chunk = 0
         self.paused = False
@@ -572,86 +601,108 @@ class SenderApp(object):
             self._degrade_gen_indices = None
             _snap_nl = self._active_n_levels
             _snap_nc = self._active_n_colors
+            _snap_cancel = self._cancel_gen
 
             def _bg_prepare():
+                cancel = _snap_cancel
                 sid_override = _snap_sid
                 degrade_indices = _snap_indices
-                meta = prepare_file_meta(
-                    path, self.chunk_size, self.box_size, self.base_dir,
-                    protocol=self.protocol, session_id=sid_override or self.session_id,
-                    grid_w=self.grid_w, grid_h=self.grid_h,
-                    module_size=self.module_size,
-                    offset=entry["offset"], length=entry["length"],
-                    display_name=entry["display_name"],
-                    n_levels=_snap_nl,
-                    n_colors=_snap_nc,
-                    color_ch=self.color_ch)
-                is_v3 = self.protocol == 3 and meta.get("grid_w") is not None
-                nl = meta.get("n_levels", 4)
-                nc = meta.get("n_colors", 1)
-                cc = meta.get("color_ch", 1)
+                meta = None
+                try:
+                    meta = prepare_file_meta(
+                        path, self.chunk_size, self.box_size, self.base_dir,
+                        protocol=self.protocol, session_id=sid_override or self.session_id,
+                        grid_w=self.grid_w, grid_h=self.grid_h,
+                        module_size=self.module_size,
+                        offset=entry["offset"], length=entry["length"],
+                        display_name=entry["display_name"],
+                        n_levels=_snap_nl,
+                        n_colors=_snap_nc,
+                        color_ch=self.color_ch)
+                    is_v3 = self.protocol == 3 and meta.get("grid_w") is not None
+                    nl = meta.get("n_levels", 4)
+                    nc = meta.get("n_colors", 1)
+                    cc = meta.get("color_ch", 1)
 
-                if is_v3:
-                    from visual_transport import calibration_frame_to_pil
-                    calib_img = calibration_frame_to_pil(
-                        meta["grid_w"], meta["grid_h"], meta["module_size"],
-                        nl, nc, cc)
-                    meta["_calib_pil"] = calib_img
+                    if cancel.is_set():
+                        return
 
-                if degrade_indices is not None and is_v3:
-                    with self._preload_lock:
-                        self.file_cache[fi] = meta
-                    total_frames = meta["total"]
-                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
-                    _log("[app] Degradation: generating only {} of {} frames".format(
-                        len(degrade_indices), total_frames))
-                    def _on_progress(batch_done, batch_total):
-                        if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
-                            self.root.after(0, lambda d=batch_done: self._update_gen_progress(fi, d, len(degrade_indices)))
-                    _generate_v3_images_into(
-                        meta["pil_images"], meta["payloads"],
-                        meta["grid_w"], meta["grid_h"], meta["module_size"],
-                        n_levels=nl, n_colors=nc, color_ch=cc,
-                        indices=degrade_indices, on_progress=_on_progress,
-                        max_workers=self.qr_workers)
-                    _log("[app] Degradation: {} frames ready".format(len(degrade_indices)))
-                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
-                else:
                     if is_v3:
-                        _, first_img = _generate_single_v3_frame((
-                            meta["payloads"][0], meta["grid_w"], meta["grid_h"],
-                            meta["module_size"], nl, nc, cc, 0))
-                    else:
-                        _, first_img = _generate_single_qr((
-                            meta["payloads"][0], meta["version"],
-                            self.box_size, 6, 0))
-                    meta["pil_images"][0] = first_img
-                    with self._preload_lock:
-                        self.file_cache[fi] = meta
-                    total_frames = meta["total"]
-                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
-                    if total_frames > 1:
-                        _log("[app] First frame ready, generating rest in background...")
+                        from visual_transport import calibration_frame_to_pil
+                        calib_img = calibration_frame_to_pil(
+                            meta["grid_w"], meta["grid_h"], meta["module_size"],
+                            nl, nc, cc)
+                        meta["_calib_pil"] = calib_img
+
+                    if degrade_indices is not None and is_v3:
+                        with self._preload_lock:
+                            self.file_cache[fi] = meta
+                        total_frames = meta["total"]
+                        self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                        _log("[app] Degradation: generating only {} of {} frames".format(
+                            len(degrade_indices), total_frames))
                         def _on_progress(batch_done, batch_total):
-                            overall = batch_done + 1
                             if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
-                                self.root.after(0, lambda d=overall: self._update_gen_progress(fi, d, total_frames))
-                        if is_v3:
-                            _generate_v3_images_into(
-                                meta["pil_images"], meta["payloads"],
-                                meta["grid_w"], meta["grid_h"], meta["module_size"],
-                                n_levels=nl, n_colors=nc, color_ch=cc,
-                                start=1, on_progress=_on_progress,
-                                max_workers=self.qr_workers)
-                    else:
-                        _generate_qr_images_into(
+                                self.root.after(0, lambda d=batch_done: self._update_gen_progress(fi, d, len(degrade_indices)))
+                        _generate_v3_images_into(
                             meta["pil_images"], meta["payloads"],
-                            meta["version"], self.box_size, 6,
-                            start=1, on_progress=_on_progress,
-                            max_workers=self.qr_workers)
-                    _log("[app] File {} all {} frames ready".format(fi + 1, total_frames))
-                self.root.after(0, lambda: self._on_file_ready(fi, meta))
-                self.root.after(0, self._preload_next)
+                            meta["grid_w"], meta["grid_h"], meta["module_size"],
+                            n_levels=nl, n_colors=nc, color_ch=cc,
+                            indices=degrade_indices, on_progress=_on_progress,
+                            max_workers=self.qr_workers, cancel_event=cancel)
+                        if cancel.is_set():
+                            return
+                        _log("[app] Degradation: {} frames ready".format(len(degrade_indices)))
+                        self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                    else:
+                        if is_v3:
+                            _, first_img = _generate_single_v3_frame((
+                                meta["payloads"][0], meta["grid_w"], meta["grid_h"],
+                                meta["module_size"], nl, nc, cc, 0))
+                        else:
+                            _, first_img = _generate_single_qr((
+                                meta["payloads"][0], meta["version"],
+                                self.box_size, 6, 0))
+                        if cancel.is_set():
+                            return
+                        meta["pil_images"][0] = first_img
+                        with self._preload_lock:
+                            self.file_cache[fi] = meta
+                        total_frames = meta["total"]
+                        self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                        if total_frames > 1:
+                            _log("[app] First frame ready, generating rest in background...")
+                            def _on_progress(batch_done, batch_total):
+                                overall = batch_done + 1
+                                if batch_done == batch_total or batch_done % max(1, batch_total // 20) == 0:
+                                    self.root.after(0, lambda d=overall: self._update_gen_progress(fi, d, total_frames))
+                            if is_v3:
+                                _generate_v3_images_into(
+                                    meta["pil_images"], meta["payloads"],
+                                    meta["grid_w"], meta["grid_h"], meta["module_size"],
+                                    n_levels=nl, n_colors=nc, color_ch=cc,
+                                    start=1, on_progress=_on_progress,
+                                    max_workers=self.qr_workers, cancel_event=cancel)
+                        else:
+                            _generate_qr_images_into(
+                                meta["pil_images"], meta["payloads"],
+                                meta["version"], self.box_size, 6,
+                                start=1, on_progress=_on_progress,
+                                max_workers=self.qr_workers, cancel_event=cancel)
+                        if cancel.is_set():
+                            return
+                        _log("[app] File {} all {} frames ready".format(fi + 1, total_frames))
+                    meta["payloads"] = None
+                    self.root.after(0, lambda: self._on_file_ready(fi, meta))
+                    self.root.after(0, self._preload_next)
+                except Exception as e:
+                    _log("[app] Prepare failed for file {}: {}".format(fi + 1, e))
+                finally:
+                    if cancel.is_set():
+                        with self._preload_lock:
+                            self.file_cache.pop(fi, None)
+                            self._tk_cache.pop(fi, None)
+                        _log("[app] Cleaned up cancelled file {}".format(fi + 1))
 
             threading.Thread(target=_bg_prepare, daemon=True).start()
         else:
@@ -710,8 +761,12 @@ class SenderApp(object):
 
         _log("[preload] Starting background thread for files {}-{}".format(
             start_idx + 1, end_idx))
+        preload_cancel = self._cancel_gen
         def _do():
             for idx in range(start_idx, end_idx):
+                if preload_cancel.is_set():
+                    _log("[preload] Cancelled")
+                    return
                 with self._preload_lock:
                     if idx in self.file_cache:
                         continue
@@ -724,7 +779,11 @@ class SenderApp(object):
                                         display_name=entry["display_name"],
                                         n_levels=self.n_levels,
                                         n_colors=self.n_colors,
-                                        color_ch=self.color_ch)
+                                        color_ch=self.color_ch,
+                                        cancel_event=preload_cancel)
+                if info is None:
+                    _log("[preload] Cancelled during file {}".format(idx + 1))
+                    return
                 with self._preload_lock:
                     self.file_cache[idx] = info
                 print("[preload] Ready {}/{}: {} ({} chunks)".format(
@@ -738,8 +797,10 @@ class SenderApp(object):
         keep_lo = self.file_index
         if limit < 0:
             keep_hi = len(self.file_entries)
+        elif limit == 0:
+            keep_hi = self.file_index
         else:
-            keep_hi = self.file_index + max(limit, 1)
+            keep_hi = self.file_index + limit
         for k in list(self.file_cache.keys()):
             if k < keep_lo or k > keep_hi:
                 del self.file_cache[k]
@@ -756,10 +817,17 @@ class SenderApp(object):
             return "V3/gray{}{}".format(nl, suffix)
         return "V3/{}c×gray{}{}".format(nc, nl, suffix)
 
-    def _cancel_pending(self):
+    def _cancel_timer(self):
+        """Cancel only the tkinter after timer, not frame generation."""
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
             self._after_id = None
+
+    def _cancel_pending(self):
+        """Cancel both timer and background frame generation."""
+        self._cancel_timer()
+        self._cancel_gen.set()
+        self._cancel_gen = threading.Event()
 
     def _start_countdown(self):
         if self._countdown_remaining > 0:
@@ -834,7 +902,7 @@ class SenderApp(object):
 
     def _advance_calib(self):
         """Move to the next protocol in the calibration sequence."""
-        self._cancel_pending()
+        self._cancel_timer()
         self._calib_chain_idx += 1
         self._show_calib_step()
 
@@ -1061,7 +1129,7 @@ class SenderApp(object):
         if self._input_mode:
             return
         if self._calib_tk_img is not None:
-            self._cancel_pending()
+            self._cancel_timer()
             self._advance_calib()
             return
         self.paused = not self.paused
@@ -1195,7 +1263,7 @@ class SenderApp(object):
         else:
             self._missing_frames = frames
             self._missing_pos = 0
-            self._cancel_pending()
+            self._cancel_timer()
             self.paused = False
             print("[missing] Retransmit mode: {} frames".format(len(frames)))
             self._show_frame()
@@ -1204,7 +1272,7 @@ class SenderApp(object):
         """Reset current file to frame 0, exit retransmit mode."""
         if self._input_mode:
             return
-        self._cancel_pending()
+        self._cancel_timer()
         self.current_chunk = 0
         self._missing_frames = None
         self._missing_pos = 0
@@ -1223,7 +1291,7 @@ class SenderApp(object):
             return
         if self._calib_tk_img is not None:
             return
-        self._cancel_pending()
+        self._cancel_timer()
         self.paused = True
         self._calib_resume_after = True
         print("[recalib] Starting re-calibration of all protocols")
@@ -1251,7 +1319,7 @@ class SenderApp(object):
         if val is not None:
             self.current_chunk = val - 1
             self.paused = False
-            self._cancel_pending()
+            self._cancel_timer()
             self._show_frame()
         else:
             self.paused = was_paused
@@ -1314,9 +1382,9 @@ def main():
     parser.add_argument("--split-size", type=str, default="1G",
                         help="Split files larger than this into segments (default: 1G). "
                              "Supports K/M/G suffixes.")
-    parser.add_argument("--preload-ahead", type=int, default=-1,
-                        help="Number of files to preload ahead (default: -1 = all, 0 = none). "
-                             "Use a small value (e.g. 1-2) for very large file sets to limit memory.")
+    parser.add_argument("--preload-ahead", type=int, default=1,
+                        help="Number of files to preload ahead (default: 1, 0 = none, -1 = all). "
+                             "Use 0 or 1 for very large file sets to limit memory.")
     args = parser.parse_args()
 
     global _verbose
