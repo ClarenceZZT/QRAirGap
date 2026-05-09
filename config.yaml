@@ -15,10 +15,10 @@ receiver:
   # num_qr: 1
 
 alert:
-  email: "zt.zhang@shinechip.net"                      # leave empty to disable
+  email: ""                      # leave empty to disable
   smtp_server: "smtp.qiye.aliyun.com"
   smtp_port: 465
-  smtp_user: "zt.zhang@shinechip.net"
-  smtp_password: "AR7GaEe9GCLoHW5n"
+  smtp_user: ""
+  smtp_password: ""
   smtp_use_tls: false
   stall_seconds: 300             # send alert after this many seconds without new frames
